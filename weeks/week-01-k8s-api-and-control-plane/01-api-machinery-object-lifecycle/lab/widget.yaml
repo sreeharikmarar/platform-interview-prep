@@ -1,0 +1,6 @@
+apiVersion: demo.io/v1
+kind: Widget
+metadata:
+  name: demo
+spec:
+  size: small

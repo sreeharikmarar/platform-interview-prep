@@ -1,0 +1,16 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: with-owner
+  labels: { owner: platform }
+spec:
+  selector:
+    matchLabels: {app: with-owner}
+  replicas: 1
+  template:
+    metadata:
+      labels: {app: with-owner, owner: platform}
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.27

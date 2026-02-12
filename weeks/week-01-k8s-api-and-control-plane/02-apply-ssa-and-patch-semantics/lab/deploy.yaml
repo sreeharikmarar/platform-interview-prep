@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ssa-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ssa-demo
+  template:
+    metadata:
+      labels:
+        app: ssa-demo
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.27
+        env:
+        - name: MODE
+          value: "alice"

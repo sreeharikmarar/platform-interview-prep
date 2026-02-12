@@ -1,0 +1,10 @@
+{
+  "includeCoAuthoredBy": false,
+  "permissions": {
+    "deny": [
+      "Bash(git push:*)"
+    ],
+    "defaultMode": "plan"
+  },
+  "alwaysThinkingEnabled": true
+}
