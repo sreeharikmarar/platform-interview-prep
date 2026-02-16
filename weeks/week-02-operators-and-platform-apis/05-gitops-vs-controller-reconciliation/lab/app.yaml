@@ -1,0 +1,15 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: drift-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: drift-demo}
+  template:
+    metadata:
+      labels: {app: drift-demo}
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.27
