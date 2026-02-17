@@ -1,0 +1,444 @@
+# East-West Gateway Multi-Cluster Reference Topology
+#
+# This file defines the Istio resources required to establish an East-West Gateway
+# (EWG) in a single cluster, plus the ServiceEntry and DestinationRule resources
+# that express the cross-cluster failover matrix for payment-service across three
+# clusters (cluster-a / cluster-b / cluster-c).
+#
+# HOW AUTO_PASSTHROUGH WORKS
+# ==========================
+# An Istio Gateway with mode: AUTO_PASSTHROUGH configures Envoy on port 15443
+# with a Listener whose filter chains use TcpProxy (not HttpConnectionManager).
+# The TcpProxy filter reads the SNI value from the incoming TLS ClientHello and
+# uses it directly as the Envoy cluster name — no TLS termination occurs. The raw
+# TLS bytes from the source sidecar's mTLS session pass through the EWG unchanged.
+#
+# The SNI value is formatted by Istio sidecars as:
+#   outbound_.<port>_.<subset>_.<fqdn>
+# Example: outbound_.8080_._.payment-service.default.svc.cluster.local
+#
+# The EWG's Envoy resolves this cluster name to actual pod IPs in the remote
+# cluster's pod network (delivered via EDS from the local istiod, which imported
+# them from the remote cluster API server using the remote secret).
+#
+# ENDPOINT DISCOVERY FLOW
+# =======================
+# 1. istiod-A is given a kubeconfig secret for cluster-B (remote secret).
+# 2. istiod-A watches cluster-B's API server: Services, Endpoints, Pods.
+# 3. istiod-A builds synthetic EDS entries for cluster-B's services, with each
+#    remote pod IP wrapped in a gatewayAddress pointing to EWG-B's LoadBalancer IP.
+# 4. istiod-A pushes these EDS entries to all sidecars in cluster-A.
+# 5. A sidecar in cluster-A routes to EWG-B:15443 with the correct SNI value.
+# 6. EWG-B forwards the connection to the actual pod IP in cluster-B.
+# 7. The destination pod's sidecar terminates TLS and validates the SPIFFE SVID.
+#
+# Apply this file to a cluster that has Istio installed (istiod running):
+#   kubectl apply -f ewg-topology.yaml
+#
+# Kubernetes 1.28+ / Istio 1.20+
+
+---
+# ============================================================================
+# PART 1: EAST-WEST GATEWAY DEPLOYMENT
+# The EWG is a dedicated Istio ingress gateway deployment for cross-cluster
+# traffic only. It runs as a separate Deployment from the north-south ingress
+# gateway and is sized for peak failover load, not steady-state load.
+# ============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: istio-eastwestgateway
+  namespace: istio-system
+  labels:
+    app: istio-eastwestgateway
+    istio: eastwestgateway
+    topology.istio.io/network: network1  # network label ties this EWG to a named network
+spec:
+  # Start with 3 replicas spread across zones for availability.
+  # Size this for peak failover traffic, not normal cross-cluster traffic,
+  # since locality-aware routing keeps most traffic local in steady state.
+  replicas: 3
+  selector:
+    matchLabels:
+      app: istio-eastwestgateway
+  template:
+    metadata:
+      labels:
+        app: istio-eastwestgateway
+        istio: eastwestgateway
+        topology.istio.io/network: network1
+      annotations:
+        # Inject the sidecar so the EWG itself participates in the mesh
+        sidecar.istio.io/inject: "true"
+        # The EWG acts as a gateway, not a regular workload — use the gateway
+        # injection template which disables iptables interception for this pod
+        inject.istio.io/templates: "gateway"
+    spec:
+      serviceAccountName: istio-eastwestgateway
+      # Anti-affinity: spread EWG pods across zones so a single zone failure
+      # does not take out all EWG capacity in this cluster.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: istio-eastwestgateway
+              topologyKey: topology.kubernetes.io/zone
+      containers:
+      - name: istio-proxy
+        # The EWG container is the Envoy proxy injected by Istio.
+        # In practice, Istio injection populates this automatically.
+        # Shown here for explicitness.
+        image: auto  # Istio injection replaces this with the configured proxy image
+        ports:
+        - containerPort: 15021  # Istio health check port
+          name: status-port
+          protocol: TCP
+        - containerPort: 15443  # EWG mTLS passthrough port (the key port)
+          name: tls
+          protocol: TCP
+        - containerPort: 15012  # istiod xDS and CA (used when EWG proxies control plane traffic)
+          name: tls-istiod
+          protocol: TCP
+        - containerPort: 15017  # istiod webhook (same use case as 15012)
+          name: tls-webhook
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /healthz/ready
+            port: 15021
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            # Do not set CPU limits (throttling causes latency spikes).
+            # Set memory limits to prevent OOMKill from taking the pod down silently.
+            memory: 1Gi
+        securityContext:
+          # Drop all capabilities — the EWG does not need any Linux capabilities.
+          capabilities:
+            drop:
+            - ALL
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 1337  # Istio proxy UID; must match iptables rules
+
+---
+# Service Account for the EWG Deployment.
+# Used by Istio to identify this workload as a gateway (not a regular pod).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: istio-eastwestgateway
+  namespace: istio-system
+
+---
+# ============================================================================
+# PART 2: EAST-WEST GATEWAY SERVICE
+# Exposed as a LoadBalancer on port 15443. The external IP of this Service is
+# what remote clusters' istiod instances publish as the "gateway address" in
+# their synthetic EDS entries for this cluster's services. Remote sidecars
+# connect to this IP when routing cross-cluster traffic.
+# ============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: istio-eastwestgateway
+  namespace: istio-system
+  labels:
+    app: istio-eastwestgateway
+    istio: eastwestgateway
+    topology.istio.io/network: network1
+  annotations:
+    # Specific to cloud providers — use a network load balancer (not application LB)
+    # for the EWG because it carries raw TCP traffic, not HTTP.
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    # Preserve client source IP through the NLB for accurate source tracking.
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+spec:
+  type: LoadBalancer
+  # No sessionAffinity: connection distribution must be spread across all EWG pods.
+  # Setting sessionAffinity: ClientIP would pin all connections from a source sidecar
+  # to a single EWG pod, eliminating horizontal scalability.
+  sessionAffinity: None
+  selector:
+    app: istio-eastwestgateway
+  ports:
+  # Status/health port — used by cloud NLB health checks to determine EWG pod health.
+  - name: status-port
+    port: 15021
+    targetPort: 15021
+    protocol: TCP
+  # The primary EWG port. All cross-cluster mTLS traffic arrives on this port.
+  # SNI routing: Envoy reads the TLS ClientHello SNI and selects the upstream
+  # cluster based solely on the SNI value. No TLS termination occurs.
+  - name: tls
+    port: 15443
+    targetPort: 15443
+    protocol: TCP
+  # Optional: expose the Istio control plane ports through the EWG if this is a
+  # primary cluster and remote clusters' istiod needs to connect to this istiod.
+  - name: tls-istiod
+    port: 15012
+    targetPort: 15012
+    protocol: TCP
+  - name: tls-webhook
+    port: 15017
+    targetPort: 15017
+    protocol: TCP
+
+---
+# ============================================================================
+# PART 3: ISTIO GATEWAY RESOURCE (AUTO_PASSTHROUGH)
+# This Gateway resource configures what the EWG Deployment (the Envoy fleet)
+# actually listens for. mode: AUTO_PASSTHROUGH is the key: it tells Istio to
+# generate an Envoy Listener on port 15443 with TcpProxy filter chains rather
+# than HttpConnectionManager, using SNI-based cluster selection.
+# ============================================================================
+
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: istio-eastwestgateway
+  namespace: istio-system
+spec:
+  # This selector matches the EWG Deployment pods defined above.
+  selector:
+    istio: eastwestgateway
+  servers:
+  - port:
+      number: 15443
+      name: tls
+      protocol: TLS
+    # The wildcard hosts selector means this Gateway accepts connections
+    # for any service SNI value routed to this port. The actual upstream
+    # selection is done by Envoy using the SNI as the cluster name.
+    hosts:
+    - "*.local"
+    tls:
+      # AUTO_PASSTHROUGH: Envoy does NOT terminate TLS. It reads the SNI,
+      # selects the upstream cluster by name, and forwards raw TLS bytes.
+      # The mTLS session between source sidecar and destination sidecar
+      # is preserved end-to-end — the EWG is transparent to it.
+      # This means the destination sidecar's PeerAuthentication policy
+      # validates the original source workload's SPIFFE SVID, not the EWG's.
+      mode: AUTO_PASSTHROUGH
+      # minProtocolVersion enforces TLS 1.2+ even though we're not terminating.
+      # This applies to the TCP-level SNI inspection, not the TLS payload.
+      minProtocolVersion: TLSV1_2
+
+---
+# ============================================================================
+# PART 4: REMOTE SECRET REFERENCE (documentation only — not a real Secret)
+# In practice, this Secret is created by running:
+#   istioctl create-remote-secret --context=cluster-b --name=cluster-b | \
+#     kubectl apply -f - --context=cluster-a
+#
+# The Secret contains a kubeconfig with credentials scoped to a service account
+# in cluster-b's istio-system namespace. istiod-A uses these credentials to
+# watch cluster-b's API server for Services, Endpoints, and Pods.
+#
+# Required RBAC for the remote watch service account (least privilege):
+#   - get/list/watch: services, endpoints, pods, nodes, namespaces
+#   - get/list/watch: configmaps (for mesh config discovery)
+#
+# The label istio/multiCluster=true is required — istiod identifies remote
+# secrets by this label, not by Secret name.
+# ============================================================================
+
+# apiVersion: v1
+# kind: Secret
+# metadata:
+#   name: istio-remote-secret-cluster-b
+#   namespace: istio-system
+#   labels:
+#     istio/multiCluster: "true"
+# type: Opaque
+# data:
+#   cluster-b: <base64-encoded kubeconfig for cluster-b>
+
+---
+# ============================================================================
+# PART 5: SERVICEENTRY — CROSS-CLUSTER ENDPOINTS FOR PAYMENT-SERVICE
+# In multi-primary mode, istiod generates these ServiceEntry resources
+# automatically from the imported endpoint data. They are shown here explicitly
+# to illustrate the failover priority structure.
+#
+# This ServiceEntry makes payment-service appear as if it has endpoints in
+# all three clusters, with priority levels encoding the failover matrix:
+#   P0 = cluster-a (local, us-east-1)
+#   P1 = cluster-c (cross-region, us-west-2)
+#   P2 = cluster-b (DR, us-east-1c)
+#
+# Envoy overflow behavior:
+#   - When all P0 endpoints are unhealthy (below panic_threshold), Envoy
+#     automatically overflows to P1 without any control plane action.
+#   - When all P0 and P1 endpoints are unhealthy, Envoy overflows to P2.
+#   - The transition is data-plane-local and sub-second.
+# ============================================================================
+
+apiVersion: networking.istio.io/v1beta1
+kind: ServiceEntry
+metadata:
+  name: payment-service-multicluster
+  namespace: default
+spec:
+  # The service hostname — must match the Kubernetes Service FQDN.
+  hosts:
+  - payment-service.default.svc.cluster.local
+  # INTERNAL: reachable only within the mesh, not from external clients.
+  location: MESH_INTERNAL
+  ports:
+  - number: 8080
+    name: http
+    protocol: HTTP
+  resolution: STATIC
+  endpoints:
+  # ---- Priority 0: cluster-a (local cluster, us-east-1) ----
+  # These are actual pod IPs in cluster-a's pod network.
+  # istiod does not set a gatewayAddress for local endpoints —
+  # the sidecar routes directly to the pod IP.
+  - address: 10.10.1.10  # payment-service pod 1, cluster-a, zone us-east-1a
+    ports:
+      http: 8080
+    locality: us-east-1/us-east-1a  # region/zone format
+    weight: 50
+    # priority 0 is the default (omitted fields default to 0)
+  - address: 10.10.2.11  # payment-service pod 2, cluster-a, zone us-east-1b
+    ports:
+      http: 8080
+    locality: us-east-1/us-east-1b
+    weight: 50
+
+  # ---- Priority 1: cluster-c (cross-region, us-west-2) ----
+  # These endpoints are reached via EWG-C's LoadBalancer IP.
+  # istiod-A imported these from cluster-c's Endpoints object and set
+  # the address to EWG-C's external IP with the appropriate SNI encoding.
+  # In AUTO_PASSTHROUGH mode, the sidecar connects to EWG-C:15443 with
+  # SNI=outbound_.8080_._.payment-service.default.svc.cluster.local
+  - address: 203.0.113.10  # EWG-C LoadBalancer IP (cluster-c, us-west-2)
+    ports:
+      http: 15443  # EWG listens on 15443, not the service port
+    locality: us-west-2/us-west-2a
+    weight: 100
+    # priority 1 = first failover target
+    labels:
+      # The network label tells Istio this endpoint is in a different network
+      # and must be reached via a gateway address.
+      topology.istio.io/network: network3
+
+  # ---- Priority 2: cluster-b (DR cluster, us-east-1c) ----
+  # Last-resort failover target. Cluster-b is in the same region as cluster-a
+  # but carries disaster-recovery replicas. It is priority 2 because latency
+  # to cluster-c (us-west-2) is better than using the DR cluster for normal
+  # failover — DR is reserved for the case where both A and C are down.
+  - address: 203.0.113.20  # EWG-B LoadBalancer IP (cluster-b, us-east-1c)
+    ports:
+      http: 15443
+    locality: us-east-1/us-east-1c
+    weight: 100
+    labels:
+      topology.istio.io/network: network2
+
+---
+# ============================================================================
+# PART 6: DESTINATIONRULE — OUTLIER DETECTION AND FAILOVER TUNING
+# The DestinationRule configures the Envoy Cluster object (via CDS) for
+# payment-service. The outlierDetection block directly controls how quickly
+# Envoy ejects unhealthy endpoints and when Envoy considers a priority group
+# exhausted and overflows to the next priority level.
+# ============================================================================
+
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: payment-service-multicluster
+  namespace: default
+spec:
+  host: payment-service.default.svc.cluster.local
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        # maxConnections per sidecar to this cluster's connection pool.
+        # For cross-cluster traffic routed through EWGs, this bounds the
+        # number of TCP connections from one sidecar to one EWG pod.
+        maxConnections: 100
+      http:
+        # h2UpgradePolicy: UPGRADE forces HTTP/2 for connections to payment-service.
+        # HTTP/2 multiplexes requests over fewer TCP connections, reducing EWG load.
+        h2UpgradePolicy: UPGRADE
+        http2MaxRequests: 1000
+        maxRequestsPerConnection: 10
+    outlierDetection:
+      # Envoy checks each endpoint every `interval` for consecutive failures.
+      # Shorter intervals mean faster ejection but more health check overhead.
+      interval: 5s
+      # Eject an endpoint after 5 consecutive 5xx responses or gateway failures.
+      # "consecutive_gateway_errors" (connection refused, reset) counts separately.
+      consecutive5xxErrors: 5
+      consecutiveGatewayErrors: 3
+      # After ejection, the endpoint is held out for `baseEjectionTime`.
+      # Subsequent ejections of the same endpoint multiply this duration.
+      baseEjectionTime: 30s
+      # Never eject more than 50% of endpoints in a priority group via outlier
+      # detection. If more than 50% fail, Envoy enters panic mode (routes to all
+      # endpoints regardless of health) rather than dropping to a near-empty pool.
+      # For stricter failover, reduce this and set healthy_panic_threshold to 0
+      # via EnvoyFilter if panic mode is undesirable.
+      maxEjectionPercent: 50
+      # Minimum time an endpoint must be healthy before it is eligible for ejection.
+      # Prevents thrashing on endpoints that are borderline healthy.
+      minHealthPercent: 30
+    loadBalancer:
+      # LEAST_REQUEST: distributes new requests to the endpoint with the fewest
+      # active requests. Better than ROUND_ROBIN for services with variable
+      # request latency (like payment-service, which may have slow DB calls).
+      simple: LEAST_REQUEST
+      # localityLbSetting controls how Envoy selects among priority groups.
+      # distribute: weighted distribution across localities (active-active).
+      # failover: strict failover ordering (active-passive). We use failover here
+      # because cluster-c and cluster-b are not active serving clusters in steady state.
+      localityLbSetting:
+        enabled: true
+        failover:
+        # If us-east-1 endpoints are unhealthy, failover to us-west-2.
+        - from: us-east-1
+          to: us-west-2
+        # If us-west-2 endpoints are also unhealthy (P1 exhausted), failover to
+        # us-east-1c (cluster-b, the DR cluster). This maps to EDS priority 2.
+        - from: us-west-2
+          to: us-east-1
+
+---
+# ============================================================================
+# PART 7: PEERAUTHENTICATION — ENFORCE STRICT MTLS FOR PAYMENT-SERVICE
+# With AUTO_PASSTHROUGH EWG, the source sidecar's SPIFFE SVID is presented
+# directly to the destination sidecar's TLS listener. PeerAuthentication in
+# STRICT mode ensures the destination sidecar rejects any plaintext connection,
+# including fallback attempts from PERMISSIVE-mode clients.
+# A trust boundary mismatch (different root CAs between clusters) will cause
+# all cross-cluster connections to fail here, which is the correct secure behavior.
+# ============================================================================
+
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: payment-service-strict-mtls
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: payment-service
+  mtls:
+    # STRICT: reject any non-mTLS connections. This ensures that if a trust
+    # boundary mismatch occurs, the failure is explicit (TLS handshake error)
+    # rather than silent (plaintext fallback with no identity validation).
+    mode: STRICT

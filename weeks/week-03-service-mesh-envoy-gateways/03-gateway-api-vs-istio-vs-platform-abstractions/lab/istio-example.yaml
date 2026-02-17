@@ -1,0 +1,294 @@
+# Istio Example: Canary Traffic Split for /api
+#
+# Three resources express the same intent as gateway-api-example.yaml, plus
+# capabilities that Gateway API cannot express:
+#   - Retry policy (attempts, perTryTimeout, retryOn)
+#   - Fault injection (delay, abort) for chaos testing
+#   - Circuit breaker (outlierDetection — Envoy outlier_detection block)
+#   - Connection pool limits (Envoy circuit_breakers block)
+#   - Subset routing (pod-label-based endpoint selection within one Service)
+#
+# xDS mapping:
+#   Istio Gateway  -> Envoy LDS Listener on the ingressgateway pod
+#   VirtualService -> Envoy RDS RouteConfiguration (via istiod push to sidecar/gateway)
+#   DestinationRule subsets -> Envoy CDS Cluster objects (one per subset per host:port)
+#                              cluster name: "outbound|8080|v1|my-svc.app.svc.cluster.local"
+#   DR trafficPolicy.outlierDetection -> Cluster.outlier_detection
+#   DR trafficPolicy.connectionPool  -> Cluster.circuit_breakers + Cluster.upstream_http_protocol_options
+
+---
+# RESOURCE 1: Istio Gateway (networking.istio.io/v1, Kind: Gateway)
+# NOTE: This is NOT the same as gateway.networking.k8s.io/v1/Gateway.
+# Istio's own Gateway CRD attaches to a running Envoy deployment via a pod label selector.
+# It translates to an Envoy Listener (LDS) on the ingress gateway pod.
+#
+# xDS: spec.servers[].port -> Listener address:port
+#      spec.servers[].tls  -> DownstreamTlsContext in the FilterChain
+#      spec.selector       -> which Envoy pod (ingressgateway) receives this LDS config
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: my-api-gateway
+  namespace: app
+  # Ownership note: in Istio's model, the Gateway CRD does not require a
+  # ReferenceGrant for cross-namespace references — VirtualServices in any
+  # namespace can reference this Gateway as "app/my-api-gateway".
+  # This is less restrictive than Gateway API's explicit authorization model.
+spec:
+  # Selector targets the ingressgateway Envoy pod(s) by pod label.
+  # istiod pushes the Listener config to Envoy processes whose pods match this selector.
+  # Multiple Gateway resources can target the same selector (configs are merged).
+  selector:
+    istio: ingressgateway     # matches the label on the default Istio ingress gateway pod
+
+  servers:
+    - port:
+        number: 80
+        name: http
+        protocol: HTTP        # use HTTPS + tls.mode: SIMPLE for TLS termination
+      hosts:
+        # Hosts that this Gateway exposes. VirtualServices that want to use this
+        # Gateway must list these hosts (or a subset) in their spec.hosts.
+        - "api.example.com"
+      # For TLS (comment out and add for production):
+      # tls:
+      #   mode: SIMPLE
+      #   credentialName: my-cert   # references a Kubernetes Secret via SDS
+
+---
+# RESOURCE 2: VirtualService (networking.istio.io/v1)
+# The central routing config in Istio's model.
+# Unlike Gateway API HTTPRoute (which is gateway-only), a VirtualService applies
+# to BOTH gateway ingress AND intra-mesh traffic (sidecar-to-sidecar routing).
+# istiod pushes RouteConfiguration updates to every Envoy that might route to spec.hosts.
+#
+# xDS: spec.http[].match[]     -> RouteConfiguration.virtual_hosts[].routes[].match
+#      spec.http[].route[]     -> routes[].route.weighted_clusters[]
+#      spec.http[].retries     -> routes[].route.retry_policy
+#      spec.http[].fault       -> routes[].route (HttpFault filter per-route config)
+#      spec.http[].timeout     -> routes[].route.timeout
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: my-svc-vs
+  namespace: app
+spec:
+  # hosts: the service(s) this VirtualService applies routing rules to.
+  # For gateway-attached VirtualServices, list the external hostname.
+  # For intra-mesh routing, list the Kubernetes service name (FQDN or short name).
+  hosts:
+    - my-svc                  # intra-mesh: matches "my-svc.app.svc.cluster.local"
+    - "api.example.com"       # external: matches the Gateway's exposed host
+
+  # gateways: which Gateways (or "mesh" for sidecar routing) this VS applies to.
+  # "mesh" = all sidecar proxies in the mesh (east-west/intra-mesh routing).
+  # "app/my-api-gateway" = the named Gateway resource in namespace app.
+  # Both listed here means: apply these rules at both the ingress gateway AND inside the mesh.
+  gateways:
+    - app/my-api-gateway      # north-south ingress (format: namespace/name)
+    - mesh                    # east-west intra-mesh sidecar routing
+
+  http:
+    # RULE 1: Canary rule — matches /api path AND x-canary: true header.
+    # Listed first: VirtualService HTTP rules are evaluated in order (first match wins).
+    # This is the same semantics as Envoy's route matching: routes[0] checked before routes[1].
+    - name: canary-header-split
+      match:
+        - uri:
+            prefix: /api          # Envoy: match.prefix = "/api"
+          headers:
+            x-canary:
+              exact: "true"       # Envoy: match.headers[{name:"x-canary", exact_match:"true"}]
+
+      route:
+        # Subset routing: "v1" and "v2" are named subsets defined in the DestinationRule below.
+        # istiod generates separate Envoy Cluster objects for each subset:
+        #   outbound|8080|v1|my-svc.app.svc.cluster.local  (pods with version=v1)
+        #   outbound|8080|v2|my-svc.app.svc.cluster.local  (pods with version=v2)
+        # Both point to the SAME Kubernetes Service (my-svc) but with different EDS label filters.
+        # This is the critical difference from Gateway API: one Service, two pod subsets.
+        - destination:
+            host: my-svc          # Kubernetes Service name (FQDN resolved by istiod)
+            subset: v1            # must exist in DestinationRule.spec.subsets
+            port:
+              number: 8080
+          weight: 90              # Envoy: weighted_clusters[0].weight = 90
+
+        - destination:
+            host: my-svc
+            subset: v2            # canary subset — pods with label version=v2
+            port:
+              number: 8080
+          weight: 10              # Envoy: weighted_clusters[1].weight = 10
+
+      # RETRY POLICY: expressed here in VirtualService — no equivalent in Gateway API HTTPRoute.
+      # Envoy: routes[].route.retry_policy
+      #   retry_on: "5xx,connect-failure,refused-stream"
+      #   num_retries: 3
+      #   per_try_timeout: 2s
+      retries:
+        attempts: 3               # maximum retry count (not including the original attempt)
+        perTryTimeout: 2s         # per-attempt timeout; total timeout = timeout field below
+        retryOn: 5xx,connect-failure,refused-stream
+        # retriable-status-codes is an Envoy extension:
+        # retryOn can also include "retriable-status-codes" with retriableStatusCodes field
+
+      # OPTIONAL: request timeout for the entire request (including retries)
+      timeout: 10s
+
+      # FAULT INJECTION: for chaos engineering / testing — no equivalent in Gateway API.
+      # Envoy: HttpFault filter per-route config (envoy.filters.http.fault).
+      # Comment out in production or gate on a header to limit blast radius.
+      # fault:
+      #   delay:
+      #     percentage:
+      #       value: 5.0          # inject delay on 5% of requests
+      #     fixedDelay: 500ms     # inject 500ms delay
+      #   abort:
+      #     percentage:
+      #       value: 1.0          # return HTTP 503 on 1% of requests
+      #     httpStatus: 503
+
+    # RULE 2: Default rule — all /api traffic without the canary header goes to stable (v1).
+    - name: stable-default
+      match:
+        - uri:
+            prefix: /api
+
+      route:
+        - destination:
+            host: my-svc
+            subset: v1
+            port:
+              number: 8080
+          weight: 100
+
+      retries:
+        attempts: 3
+        perTryTimeout: 2s
+        retryOn: 5xx,connect-failure,refused-stream
+
+      timeout: 10s
+
+---
+# RESOURCE 3: DestinationRule (networking.istio.io/v1)
+# Configures how Envoy treats the destination cluster at the connection level.
+# This is entirely absent from Gateway API — there is no HTTPRoute or Gateway API
+# resource that controls outlierDetection, connectionPool, or load-balancer policy.
+#
+# xDS mapping:
+#   trafficPolicy.connectionPool.http -> Cluster.circuit_breakers (Envoy circuit breaker thresholds)
+#   trafficPolicy.outlierDetection   -> Cluster.outlier_detection (passive health checking)
+#   trafficPolicy.loadBalancer       -> Cluster.lb_policy
+#   spec.subsets                     -> separate Cluster objects per subset in CDS
+#                                       (cluster name: outbound|<port>|<subset>|<FQDN>)
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: my-svc-dr
+  namespace: app
+spec:
+  # host must match the Kubernetes Service FQDN or short name.
+  # istiod resolves short names relative to the DestinationRule's namespace.
+  host: my-svc
+
+  # trafficPolicy applies to ALL subsets unless overridden at the subset level.
+  # These settings map to Envoy Cluster config pushed via CDS.
+  trafficPolicy:
+    # CONNECTION POOL: maps to Envoy's circuit_breakers block.
+    # Controls how many connections/requests Envoy allows to this cluster.
+    # Envoy: Cluster.circuit_breakers.thresholds[priority=DEFAULT]
+    connectionPool:
+      tcp:
+        maxConnections: 100       # Envoy: max_connections (L4 connections to upstream)
+        connectTimeout: 5s        # Envoy: connect_timeout on the upstream cluster
+      http:
+        http1MaxPendingRequests: 100  # Envoy: max_pending_requests (HTTP/1.1 queue depth)
+        http2MaxRequests: 1000        # Envoy: max_requests (concurrent active HTTP/2 streams)
+        maxRequestsPerConnection: 10  # Envoy: max_requests_per_connection (drain after N requests)
+
+    # OUTLIER DETECTION: maps to Envoy's outlier_detection block (passive health checking).
+    # Envoy ejects endpoints that exceed error thresholds from the load-balancing pool.
+    # This is the "circuit breaker" behavior for upstream failures.
+    # Envoy: Cluster.outlier_detection
+    outlierDetection:
+      # Eject an endpoint after 5 consecutive gateway errors (502, 503, 504 from upstream).
+      # Envoy: outlier_detection.consecutive_gateway_failure
+      consecutiveGatewayErrors: 5
+
+      # Also eject after 5 consecutive 5xx errors (broader than gateway errors).
+      # Envoy: outlier_detection.consecutive_5xx
+      consecutive5xxErrors: 5
+
+      # How often Envoy scans the pool for ejection candidates.
+      # Envoy: outlier_detection.interval
+      interval: 30s
+
+      # How long an ejected endpoint stays ejected before being re-admitted.
+      # Actual ejection time = baseEjectionTime * ejection count (exponential backoff).
+      # Envoy: outlier_detection.base_ejection_time
+      baseEjectionTime: 30s
+
+      # Maximum percentage of endpoints that can be ejected simultaneously.
+      # Prevents outlier detection from removing the entire cluster.
+      # Default is 10%; raise if you have small clusters (e.g., 2-3 pods).
+      # Envoy: outlier_detection.max_ejection_percent
+      maxEjectionPercent: 50
+
+    # LOAD BALANCER POLICY: maps to Envoy's Cluster.lb_policy.
+    # ROUND_ROBIN = Envoy ROUND_ROBIN (default)
+    # LEAST_CONN  = Envoy LEAST_REQUEST
+    # RANDOM      = Envoy RANDOM
+    # PASSTHROUGH = Envoy ORIGINAL_DST (used for transparent proxy scenarios)
+    loadBalancer:
+      simple: LEAST_CONN        # prefer least-active-connections routing for API traffic
+
+  # SUBSETS: each subset generates a distinct Envoy Cluster in CDS.
+  # The cluster name format istiod uses: "outbound|<port>|<subset>|<host FQDN>"
+  # Example: "outbound|8080|v1|my-svc.app.svc.cluster.local"
+  #
+  # EDS for each subset cluster is filtered to only include pods matching the labels.
+  # If no pods match, the cluster has zero endpoints → VirtualService routes to this subset
+  # will get UH (upstream unhealthy) 503 response flags.
+  subsets:
+    - name: v1
+      # Label selector: only pods with label "version: v1" are included in this cluster's EDS.
+      # This means v1 and v2 can share the same Kubernetes Service but receive independent
+      # connection pool limits, health checks, and outlier detection state.
+      labels:
+        version: v1
+
+    - name: v2
+      labels:
+        version: v2
+      # Per-subset trafficPolicy OVERRIDE: the canary subset gets a tighter connection pool.
+      # This prevents a misbehaving canary from consuming all upstream connections.
+      # Without this, the canary inherits the top-level trafficPolicy.connectionPool.
+      trafficPolicy:
+        connectionPool:
+          http:
+            http1MaxPendingRequests: 10   # tighter limit for canary: shed load early
+            http2MaxRequests: 50
+
+# WHAT ISTIO ADDS THAT GATEWAY API LACKS (summary):
+#
+# 1. Subset routing:  DR subsets + VS destination.subset = pod-label-based endpoint selection
+#    Gateway API:     backendRefs point to Services only; two Services needed for v1/v2
+#
+# 2. Circuit breaker: DR trafficPolicy.outlierDetection -> Envoy outlier_detection
+#    Gateway API:     no equivalent resource or field exists
+#
+# 3. Connection pool: DR trafficPolicy.connectionPool -> Envoy circuit_breakers thresholds
+#    Gateway API:     no equivalent resource or field exists
+#
+# 4. Retry policy:    VS spec.http[].retries -> Envoy routes[].route.retry_policy
+#    Gateway API:     GEP-713 policy attachment proposal; not widely implemented as of 2025
+#
+# 5. Fault injection: VS spec.http[].fault -> Envoy HttpFault filter per-route config
+#    Gateway API:     no equivalent
+#
+# 6. Mesh-wide scope: VS gateways: [mesh] applies to ALL sidecar outbound routes
+#    Gateway API:     HTTPRoute is gateway-scoped only; no intra-mesh routing concept
+#
+# 7. mTLS policy:     PeerAuthentication (separate resource, not shown here)
+#    Gateway API:     BackendTLSPolicy covers gateway->backend TLS; no sidecar mTLS API

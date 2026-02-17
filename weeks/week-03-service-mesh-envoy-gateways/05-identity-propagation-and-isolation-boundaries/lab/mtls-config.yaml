@@ -1,0 +1,533 @@
+# =============================================================================
+# Lab Reference: mTLS Identity Configuration for Service Mesh
+# Topic: Service Identity Propagation & Isolation Boundaries
+# Target: Kubernetes 1.28+ / Istio 1.20+
+#
+# This file contains the complete set of Istio security resources for the
+# three-service topology used in the lab exercises. Read the comments carefully:
+# they explain WHY each field is set, not just what it does.
+#
+# Topology:
+#   external client (JWT) → ingress-gateway → service-a (team-a) → service-b (team-b)
+#
+# SPIFFE ID format used throughout:
+#   spiffe://<trust-domain>/ns/<namespace>/sa/<service-account>
+#   e.g. spiffe://cluster.local/ns/team-a/sa/service-a
+#
+# SDS certificate delivery flow:
+#   1. Sidecar starts, opens gRPC SDS stream to istiod:15012
+#   2. Sidecar requests secret "default" (workload cert) and "ROOTCA" (trust bundle)
+#   3. Istiod validates the pod's service account JWT via TokenReview API
+#   4. Istiod signs an X.509 cert with the SPIFFE URI in the SAN field
+#   5. Cert + private key delivered in SDS DiscoveryResponse
+#   6. Envoy loads into DownstreamTlsContext (inbound) + UpstreamTlsContext (outbound)
+#   7. At ~80% of TTL (default ~20h), istiod pushes a new SDS response
+#   8. Envoy hot-swaps; existing TLS sessions are not disrupted
+# =============================================================================
+
+---
+# =============================================================================
+# PeerAuthentication: Enforce STRICT mTLS for the team-a namespace
+#
+# What this does: requires ALL inbound connections to team-a workloads to
+# present a valid mTLS client certificate. Plaintext connections are rejected.
+#
+# Why STRICT and not PERMISSIVE:
+#   PERMISSIVE allows plaintext fallback. If a trust bundle mismatch occurs
+#   (e.g. after cross-cluster CA rotation), connections that should fail TLS
+#   will silently fall back to plaintext. STRICT makes trust failures visible
+#   immediately as 503 errors rather than as silent authentication bypasses.
+#
+# Scope: no workloadSelector = applies to all pods in team-a namespace.
+# =============================================================================
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: team-a-strict-mtls
+  namespace: team-a
+spec:
+  # No workloadSelector: applies to the entire namespace.
+  # To scope to a specific workload, add:
+  #   selector:
+  #     matchLabels:
+  #       app: service-a
+  mtls:
+    mode: STRICT
+    # STRICT: all inbound connections must present a valid SVID.
+    # The SVID must be signed by a CA in the ROOTCA trust bundle (delivered via SDS).
+    # Envoy rejects connections without a client cert with a TLS handshake error.
+    # Response flag in access log: DC (downstream connection termination)
+
+---
+# =============================================================================
+# PeerAuthentication: Enforce STRICT mTLS for the team-b namespace
+#
+# Same rationale as team-a. Both namespaces enforce STRICT so that:
+# 1. No workload can communicate without a valid SPIFFE identity
+# 2. AuthorizationPolicy source.principal evaluation is always meaningful
+#    (if plaintext were allowed, source.principal would be empty, which
+#     makes writing meaningful policies much harder)
+# =============================================================================
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: team-b-strict-mtls
+  namespace: team-b
+spec:
+  mtls:
+    mode: STRICT
+
+---
+# =============================================================================
+# RequestAuthentication: JWT validation for service-a
+#
+# What this does: validates JWTs presented in the Authorization header (or
+# other configured locations) against the specified issuer's JWKS.
+#
+# Key concepts:
+#   - This resource does NOT deny requests without a JWT. It only validates
+#     JWTs that ARE present. To deny unauthenticated requests, you need an
+#     AuthorizationPolicy that requires request.auth.principal to be non-empty.
+#   - A successfully validated JWT populates:
+#       request.auth.principal  = "<issuer>/<sub claim>"
+#       request.auth.claims[*]  = individual claims from the JWT payload
+#     These are available for AuthorizationPolicy evaluation.
+#   - JWT-SVID format: sub = "spiffe://trust-domain/ns/namespace/sa/service-account"
+#     This is how SPIFFE identity travels as a JWT across trust domain boundaries.
+#
+# Why both mTLS AND JWT:
+#   mTLS proves the identity of the immediately preceding hop (the network peer).
+#   JWT proves the identity of the original end user or calling service across
+#   multiple hops. Together they enable layered identity: "the gateway vouches
+#   that this JWT came from a verified user/service."
+# =============================================================================
+apiVersion: security.istio.io/v1beta1
+kind: RequestAuthentication
+metadata:
+  name: service-a-jwt-validation
+  namespace: team-a
+spec:
+  selector:
+    matchLabels:
+      app: service-a
+  jwtRules:
+  - issuer: "https://accounts.example.com"
+    # JWKS URI: the public key endpoint used to verify JWT signatures.
+    # Envoy fetches and caches this. Must be reachable from the sidecar.
+    jwksUri: "https://accounts.example.com/.well-known/jwks.json"
+
+    # forwardOriginalToken: forward the raw JWT to the upstream application.
+    # Set to true when service-a's application code also needs to inspect the JWT
+    # (e.g. for user context). Set to false if you want the sidecar to strip it
+    # after validation (reduces token exposure to upstream services).
+    forwardOriginalToken: true
+
+    # audiences: the JWT must contain one of these values in its "aud" claim.
+    # This prevents token reuse: a JWT issued for service-a cannot be replayed
+    # against service-b if service-b has a different audience.
+    audiences:
+    - "service-a.team-a.svc.cluster.local"
+
+    # outputClaimToHeaders: copy specific JWT claims into HTTP request headers.
+    # The sidecar injects these headers before forwarding to the application.
+    # Useful when the application needs claim values without parsing the JWT.
+    outputClaimToHeaders:
+    - header: "x-jwt-sub"
+      claim: "sub"
+    - header: "x-jwt-role"
+      claim: "role"
+    - header: "x-jwt-scope"
+      claim: "scope"
+
+---
+# =============================================================================
+# RequestAuthentication: JWT validation for service-b
+#
+# service-b validates the same JWT that was forwarded by service-a.
+# The JWT was originally issued to the external caller; service-a forwarded it
+# to service-b (forwardOriginalToken: true above).
+#
+# This pattern allows service-b to enforce caller-identity-based policies
+# using request.auth.claims[scope] even though the mTLS peer at the
+# service-b boundary is service-a (not the original external caller).
+# =============================================================================
+apiVersion: security.istio.io/v1beta1
+kind: RequestAuthentication
+metadata:
+  name: service-b-jwt-validation
+  namespace: team-b
+spec:
+  selector:
+    matchLabels:
+      app: service-b
+  jwtRules:
+  - issuer: "https://accounts.example.com"
+    jwksUri: "https://accounts.example.com/.well-known/jwks.json"
+    forwardOriginalToken: false  # service-b does not forward JWT further; it's the last hop
+    audiences:
+    - "service-b.team-b.svc.cluster.local"
+
+---
+# =============================================================================
+# AuthorizationPolicy: Allow access to service-a from the ingress gateway
+#
+# Layer 1 check (mTLS): source.principal must be the ingress gateway's SVID.
+#   spiffe://cluster.local/ns/istio-system/sa/istio-ingressgateway
+#   Written as: "cluster.local/ns/istio-system/sa/istio-ingressgateway"
+#   (Istio drops the "spiffe://" prefix in AuthorizationPolicy principals)
+#
+# Layer 2 check (JWT): the JWT must be present and valid (request.auth.principal
+#   is non-empty) AND the "role" claim must be "admin" or "operator".
+#
+# Why this combination:
+#   - source.principal alone would allow any compromised gateway to make calls
+#   - request.auth.claims alone could be spoofed if the JWT is stolen and replayed
+#     from a different network location
+#   - Together: the caller must be on the right network path (mTLS) AND carry
+#     a valid JWT with the right claims (application-layer identity)
+# =============================================================================
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: service-a-allow-gateway
+  namespace: team-a
+spec:
+  selector:
+    matchLabels:
+      app: service-a
+  action: ALLOW
+  rules:
+  - from:
+    - source:
+        # mTLS peer must be the ingress gateway.
+        # This is the SPIFFE URI of the gateway's service account, without "spiffe://"
+        principals:
+        - "cluster.local/ns/istio-system/sa/istio-ingressgateway"
+    to:
+    - operation:
+        # Restrict to specific HTTP methods. Omitting this allows all methods.
+        methods: ["GET", "POST", "PUT"]
+        # Restrict to the API path prefix. Wildcards use Go path.Match syntax.
+        paths: ["/api/v1/*"]
+    when:
+    # JWT must be present and valid (RequestAuthentication has processed it)
+    - key: request.auth.principal
+      values: ["*"]  # non-empty: any validated JWT principal is accepted here
+    # JWT "role" claim must be "admin" or "operator"
+    - key: request.auth.claims[role]
+      values: ["admin", "operator"]
+
+---
+# =============================================================================
+# AuthorizationPolicy: Deny all unauthenticated traffic to team-a
+#
+# DENY policies are evaluated BEFORE ALLOW policies in Istio.
+# This DENY rule blocks any request that has no mTLS peer certificate
+# (source.notPrincipals: ["*"] matches when source.principal is empty,
+# which happens on plaintext connections or connections without a client cert).
+#
+# Combined effect with service-a-allow-gateway:
+#   1. DENY rule evaluated first: if no mTLS peer → DENY
+#   2. ALLOW rule evaluated: if mTLS peer = gateway AND JWT valid → ALLOW
+#   3. No matching ALLOW rule → implicit DENY (Istio default when any ALLOW policy exists)
+#
+# This creates a default-deny posture: explicitly permitted callers with
+# explicit credentials are allowed; everything else is denied.
+# =============================================================================
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: team-a-deny-no-mtls
+  namespace: team-a
+spec:
+  # No selector: applies to all workloads in team-a namespace
+  action: DENY
+  rules:
+  - from:
+    - source:
+        # notPrincipals: ["*"] matches when source.principal is empty (no mTLS cert).
+        # An empty principal means the connection arrived without a client certificate.
+        notPrincipals: ["*"]
+
+---
+# =============================================================================
+# AuthorizationPolicy: Allow service-a to call service-b with payment scope
+#
+# This policy combines:
+#   1. mTLS peer identity: source.principal = service-a's SVID
+#   2. JWT claim check: scope must contain "payments.write"
+#   3. HTTP operation: method POST, path prefix /api/v1/payments
+#
+# All conditions within a single rule block are AND'd.
+# Multiple rule blocks under "rules:" are OR'd.
+#
+# The "when" conditions use request.auth.claims which are populated by
+# RequestAuthentication after validating the JWT. The JWT was originally
+# issued to the external caller and forwarded through the chain by service-a.
+# Service-b validates the JWT itself (see RequestAuthentication above) and
+# then evaluates the claims in this AuthorizationPolicy.
+#
+# Interview note: this pattern answers "how do you enforce per-user
+# authorization at service-b when the mTLS peer is service-a, not the user?"
+# The answer is: mTLS enforces the network-level caller (service-a must be the
+# peer), and JWT claims enforce the application-level caller (the original user
+# must have the right scope). Both must be satisfied simultaneously.
+# =============================================================================
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: service-b-allow-service-a-payments
+  namespace: team-b
+spec:
+  selector:
+    matchLabels:
+      app: service-b
+  action: ALLOW
+  rules:
+  - from:
+    - source:
+        principals:
+        # mTLS peer must be service-a.
+        # service-a's SPIFFE URI: spiffe://cluster.local/ns/team-a/sa/service-a
+        - "cluster.local/ns/team-a/sa/service-a"
+    to:
+    - operation:
+        methods: ["POST"]
+        paths: ["/api/v1/payments*"]
+    when:
+    # The JWT must carry scope = "payments.write"
+    # This claim is set by the authorization server based on the user's permissions
+    - key: request.auth.claims[scope]
+      values: ["payments.write"]
+  # Second rule: allow service-a to call read-only endpoints without scope check
+  - from:
+    - source:
+        principals:
+        - "cluster.local/ns/team-a/sa/service-a"
+    to:
+    - operation:
+        methods: ["GET"]
+        paths: ["/api/v1/payments*", "/health", "/ready"]
+
+---
+# =============================================================================
+# AuthorizationPolicy: Deny unauthenticated traffic to team-b
+#
+# Same default-deny pattern as team-a. Denies any connection without an mTLS
+# peer certificate. Works in conjunction with PeerAuthentication STRICT (which
+# rejects plaintext at the TLS layer) as a defense-in-depth measure.
+#
+# The combination of PeerAuthentication STRICT + this DENY policy means:
+#   - PeerAuthentication STRICT: rejects plaintext TCP connections before any
+#     HTTP processing occurs (network layer protection)
+#   - This DENY policy: denies mTLS connections where the peer cert is missing
+#     or the principal is empty (application layer protection, catches edge cases
+#     where TLS was established without a client cert, e.g. one-way TLS)
+# =============================================================================
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: team-b-deny-no-mtls
+  namespace: team-b
+spec:
+  action: DENY
+  rules:
+  - from:
+    - source:
+        notPrincipals: ["*"]
+
+---
+# =============================================================================
+# Sidecar: Scope service-a's egress to reduce xDS config volume and blast radius
+#
+# What this does: limits which services service-a's sidecar learns about via xDS.
+# By default, Istio pushes the full mesh service registry (every service in every
+# namespace) to every sidecar as CDS (clusters) and RDS (routes) entries. In a
+# large mesh with hundreds of services, this creates large xDS payloads and means
+# that a single misconfigured VirtualService anywhere in the mesh can affect
+# routing for unrelated services.
+#
+# With this Sidecar resource, service-a's sidecar only receives xDS config for:
+#   1. Services in its own namespace (team-a/*)
+#   2. service-b in team-b (the only cross-namespace dependency)
+#   3. istio-system for telemetry, health checks, and istiod communication
+#
+# Blast radius benefit: a VirtualService misconfiguration in team-c, team-d, or
+# any other namespace does not affect service-a's sidecar at all — it never
+# receives that config.
+#
+# Ownership boundary benefit: by not receiving config for other teams' services,
+# service-a cannot accidentally route traffic to them even if its application code
+# has a bug that constructs an incorrect destination URL.
+# =============================================================================
+apiVersion: networking.istio.io/v1beta1
+kind: Sidecar
+metadata:
+  name: service-a-egress-scope
+  namespace: team-a
+spec:
+  workloadSelector:
+    labels:
+      app: service-a
+  egress:
+  - hosts:
+    # Allow outbound calls to any service within team-a (own namespace)
+    - "team-a/*"
+    # Allow outbound calls to service-b only in team-b (explicit cross-namespace dependency)
+    # Format: "<namespace>/<fully-qualified-hostname>"
+    # Using the exact service FQDN prevents service-a from calling other team-b services
+    - "team-b/service-b.team-b.svc.cluster.local"
+    # Allow access to istio-system for:
+    #   - istiod SDS endpoint (cert delivery)
+    #   - Prometheus metrics scraping
+    #   - Zipkin/Jaeger trace export
+    - "istio-system/*"
+  # ingress: not specified = use default (accept all inbound, governed by PeerAuthentication)
+  # outboundTrafficPolicy: not specified = defaults to mesh-wide setting (ALLOW_ANY or REGISTRY_ONLY)
+
+---
+# =============================================================================
+# Sidecar: Scope service-b's egress
+#
+# service-b is a leaf service — it calls no other services. Restricting its
+# egress to only istio-system (for telemetry) and its own namespace prevents
+# any accidental outbound calls from service-b's application code.
+#
+# In a security audit context: a Sidecar resource with a minimal egress list
+# is evidence that a service's network blast radius has been explicitly bounded.
+# It demonstrates operational discipline and reduces the attack surface if
+# service-b is compromised (a compromised service-b cannot reach payment
+# infrastructure, other team namespaces, or any unexpected endpoints).
+# =============================================================================
+apiVersion: networking.istio.io/v1beta1
+kind: Sidecar
+metadata:
+  name: service-b-egress-scope
+  namespace: team-b
+spec:
+  workloadSelector:
+    labels:
+      app: service-b
+  egress:
+  - hosts:
+    - "team-b/*"
+    - "istio-system/*"
+    # service-b makes no cross-namespace calls; no other hosts are needed
+
+---
+# =============================================================================
+# DestinationRule: Configure outbound mTLS mode for service-b from service-a
+#
+# What this does: instructs service-a's sidecar to use ISTIO_MUTUAL mode when
+# connecting to service-b. ISTIO_MUTUAL means Envoy uses the workload certificate
+# (delivered via SDS) for the upstream TLS connection, and validates the upstream's
+# certificate against the trust bundle.
+#
+# ISTIO_MUTUAL vs SIMPLE vs MUTUAL:
+#   ISTIO_MUTUAL: use the sidecar's own SVID (from SDS), validate peer against ROOTCA.
+#                 This is the standard mode for Istio intra-mesh mTLS. The cert
+#                 is managed by Istio (auto-rotated); you do not manage it.
+#   SIMPLE:       one-way TLS — Envoy validates the server cert but does not
+#                 present a client cert. Server cannot verify client identity via mTLS.
+#   MUTUAL:       explicit mutual TLS where you provide your own client cert files.
+#                 Used for connections to non-Istio services that require mTLS with
+#                 externally managed certificates.
+#   DISABLE:      no TLS; plaintext connection. Use only for non-mesh services
+#                 or during migration.
+#
+# subjectAltNames: the SAN values Envoy must find in the upstream's certificate.
+# If the upstream presents a cert without this SAN, the connection is rejected.
+# This prevents man-in-the-middle attacks: even if the cert is signed by the
+# right CA, it must also encode the expected workload identity.
+#
+# XFCC header note:
+# DestinationRule controls outbound TLS from service-a's sidecar to service-b.
+# The XFCC header injection (which carries the caller's SPIFFE URI to service-b's
+# application layer) is controlled by the sidecar's HCM config, NOT DestinationRule.
+# In Istio, sidecar proxies inject XFCC by default for outbound mTLS connections
+# (controlled by the mesh config's "ingressControllerMode" and HCM settings).
+# To inspect the current XFCC setting:
+#   istioctl proxy-config listener deploy/service-a.team-a -o json | \
+#     jq '.[].filterChains[].filters[] |
+#     select(.name=="envoy.filters.network.http_connection_manager") |
+#     .typedConfig.forwardClientCertDetails'
+# =============================================================================
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: service-b-mtls
+  namespace: team-a
+spec:
+  # Apply this rule when service-a (in team-a) calls service-b's hostname
+  host: service-b.team-b.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+      # subjectAltNames: the SPIFFE URI that service-b's certificate MUST contain.
+      # Envoy validates this against the SAN field of service-b's X.509-SVID.
+      # If service-b presents a cert with a different SAN (e.g. after a namespace
+      # change or a misconfigured service account), the connection is rejected.
+      # Format: spiffe://<trust-domain>/ns/<namespace>/sa/<service-account>
+      subjectAltNames:
+      - "spiffe://cluster.local/ns/team-b/sa/service-b"
+
+---
+# =============================================================================
+# DestinationRule: Configure connection pool settings for service-b
+#
+# This is a separate DestinationRule from the mTLS config above because
+# connection pool settings and TLS settings serve different concerns.
+# In practice, you can merge them into a single DestinationRule.
+#
+# Why connection pool settings matter for identity:
+# If service-b's mTLS cert rotates (SDS push from istiod), existing connections
+# in the connection pool continue using the OLD cert until they are closed.
+# The new cert is used only for NEW connections. For most workloads this is fine
+# (24h cert TTL, connections are short-lived). For long-lived gRPC streams or
+# HTTP keep-alive connections, you may need to tune maxConnectionsPerHost so
+# connections are recycled frequently enough to pick up rotated certs.
+#
+# connectTimeout: how long Envoy waits for the upstream TCP connection to complete.
+# For mTLS, this includes the TLS handshake. If istiod has not yet delivered
+# service-b's cert to service-b's sidecar (SDS delay at startup), the handshake
+# will hang until this timeout is reached.
+# =============================================================================
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: service-b-connection-pool
+  namespace: team-a
+spec:
+  host: service-b.team-b.svc.cluster.local
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        # Maximum number of HTTP connections to service-b per sidecar instance.
+        # Relevant for SVID rotation: connections are held open; rotating a cert
+        # on service-b's sidecar requires new connections to use the new cert.
+        maxConnections: 100
+        # Timeout for establishing the TCP+TLS connection to service-b.
+        # Set high enough to accommodate SDS delivery delay at startup (~2-5s).
+        connectTimeout: 5s
+      http:
+        # Maximum number of HTTP/2 requests multiplexed on a single connection.
+        # Lower values increase connection cycling frequency, helping certs rotate faster
+        # but increasing TCP connection overhead.
+        http2MaxRequests: 1000
+        # Idle connection timeout: close connections that have been idle this long.
+        # Shorter values recycle connections faster (better for cert rotation),
+        # longer values reduce TCP handshake overhead (better for throughput).
+        idleTimeout: 90s
+    # Outlier detection: eject service-b endpoints that fail mTLS handshakes.
+    # This is important during CA rotation: if service-b's new cert is not yet
+    # trusted by service-a's trust bundle, handshakes will fail. Outlier detection
+    # will eject the failing endpoint rather than continuously retrying.
+    outlierDetection:
+      # Eject after 5 consecutive 5xx responses (includes TLS errors)
+      consecutive5xxErrors: 5
+      # Check for ejection candidates every 10 seconds
+      interval: 10s
+      # Keep ejected endpoints out for at least 30 seconds
+      baseEjectionTime: 30s
+      # Never eject more than 50% of endpoints (preserve availability)
+      maxEjectionPercent: 50

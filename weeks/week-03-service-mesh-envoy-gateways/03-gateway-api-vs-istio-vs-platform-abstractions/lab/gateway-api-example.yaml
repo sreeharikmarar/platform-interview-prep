@@ -1,0 +1,211 @@
+# Gateway API Example: Canary Traffic Split for /api
+#
+# Three resources express the routing intent:
+#   1. GatewayClass  — cluster-scoped, owned by infra team, declares the controller
+#   2. Gateway       — namespace: infra, owned by infra team, declares the listener
+#   3. HTTPRoute     — namespace: app, owned by app team, declares the routing rules
+#
+# Cross-namespace attachment (HTTPRoute in app -> Gateway in infra) requires a
+# ReferenceGrant in namespace: infra. See the ReferenceGrant resource at the bottom.
+#
+# xDS mapping:
+#   GatewayClass.spec.controllerName  -> which controller claims this class
+#   Gateway.spec.listeners[]          -> Envoy LDS Listener (address:port, TLS context)
+#   HTTPRoute.spec.rules[].matches[]  -> Envoy RDS RouteConfiguration VirtualHost Route
+#                                        (match.prefix, match.headers[])
+#   HTTPRoute.spec.rules[].backendRefs[].weight -> Envoy weighted_clusters weight
+
+---
+# RESOURCE 1: GatewayClass
+# Cluster-scoped. Owned by the infrastructure / platform team.
+# controllerName identifies which controller will reconcile Gateways of this class.
+# Istio's Gateway API implementation watches for this exact controllerName.
+# Status: the controller sets status.conditions[type=Accepted]=True when it claims this class.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: istio-gateway-class
+spec:
+  # Istio's Gateway API controller identifier.
+  # If using Envoy Gateway instead: gateway.envoyproxy.io/gatewayclass-controller
+  controllerName: istio.io/gateway-controller
+  description: "Istio-backed gateway class for north-south ingress traffic"
+
+---
+# RESOURCE 2: Gateway
+# Namespace-scoped (infra namespace). Owned by the infrastructure team.
+# Declares one or more listeners: protocol, port, TLS mode, hostname filter.
+# allowedRoutes controls which namespaces and Route kinds can attach.
+#
+# xDS: this Gateway translates to an Envoy Listener resource (LDS).
+# The listener binds to the gateway pod's address on the specified port.
+# TLS termination config (DownstreamTlsContext) is set based on tls.mode.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: shared-ingress-gateway
+  namespace: infra
+  labels:
+    managed-by: infra-team
+spec:
+  # Which GatewayClass manages this Gateway
+  gatewayClassName: istio-gateway-class
+
+  listeners:
+    - name: http
+      # Port 80 for HTTP; in production use 443 with TLS mode: Terminate
+      port: 80
+      protocol: HTTP
+      # Hostname filter: only routes with matching hostnames will attach.
+      # Use "*" to allow any hostname (useful for wildcard/dev environments).
+      hostname: "api.example.com"
+
+      allowedRoutes:
+        # namespaces.from: All  = any namespace can attach Routes to this listener.
+        # In production: use "Selector" with a label selector to restrict
+        # to namespaces labeled "gateway-access: allowed", which the platform
+        # team controls via the namespace provisioning workflow.
+        namespaces:
+          from: All
+        # Only HTTPRoute objects may attach; reject GRPCRoute or TCPRoute
+        kinds:
+          - group: gateway.networking.k8s.io
+            kind: HTTPRoute
+
+# Status (set by controller after reconciliation — shown here for reference):
+# status:
+#   conditions:
+#     - type: Programmed
+#       status: "True"
+#   listeners:
+#     - name: http
+#       attachedRoutes: 1   # increments as HTTPRoutes attach
+#       conditions:
+#         - type: Accepted
+#           status: "True"
+
+---
+# RESOURCE 3: ReferenceGrant
+# Namespace-scoped (infra namespace — the TARGET namespace).
+# This is an authorization primitive: it allows an HTTPRoute in namespace "app"
+# to reference the Gateway in namespace "infra".
+# Without this, the HTTPRoute's parentRef is silently ignored: the controller
+# sets status.parents[].conditions[type=Accepted].reason = "RefNotPermitted".
+#
+# The platform team creates this during namespace onboarding — app teams
+# should not create their own ReferenceGrants in the infra namespace.
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-app-routes
+  namespace: infra          # must be in the TARGET namespace (where the Gateway lives)
+spec:
+  # "from" describes who is allowed to reference resources in this namespace
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: app        # the namespace where the HTTPRoute lives
+  # "to" describes which resources in this namespace can be referenced
+  to:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      # Omit "name" to allow reference to any Gateway in this namespace.
+      # Specify "name: shared-ingress-gateway" to restrict to a single Gateway.
+
+---
+# RESOURCE 4: HTTPRoute
+# Namespace-scoped (app namespace). Owned by the application team.
+# Attaches to the Gateway in infra namespace via parentRefs.
+# Expresses the canary split: 90% stable / 10% canary for header x-canary: true.
+#
+# xDS mapping (what Istio's Gateway API controller generates from this):
+#   spec.rules[].matches[0].path  -> RouteConfiguration.virtual_hosts[].routes[].match.prefix
+#   spec.rules[].matches[0].headers[] -> routes[].match.headers[]
+#   spec.rules[].backendRefs[].weight -> routes[].route.weighted_clusters[].weight
+#   backendRefs[].name+port -> weighted_clusters[].cluster_header or cluster name
+#                              (cluster name format: <namespace>/<service>|<port>)
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: my-api-canary-route
+  namespace: app
+  labels:
+    managed-by: app-team
+    app: my-svc
+spec:
+  # Attach to the shared Gateway in the infra namespace.
+  # sectionName: http pins this Route to the named listener "http" specifically.
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: shared-ingress-gateway
+      namespace: infra          # cross-namespace: requires ReferenceGrant above
+      sectionName: http         # attach only to the "http" listener
+
+  # hostnames: further filters which requests this Route handles.
+  # Must be a subset of the Gateway listener's hostname.
+  hostnames:
+    - "api.example.com"
+
+  rules:
+    # RULE 1: Canary rule — matches /api path AND x-canary: true header.
+    # Listed first because HTTPRoute rules are evaluated in order (first match wins).
+    # This rule applies the 90/10 weight split.
+    - matches:
+        - path:
+            type: PathPrefix       # Envoy: match.prefix = "/api"
+            value: /api
+          headers:
+            # Header match: exact value match on x-canary header.
+            # Envoy: routes[].match.headers[{name: "x-canary", exact_match: "true"}]
+            - name: x-canary
+              value: "true"
+              type: Exact
+
+      # backendRefs with weight implement a weighted cluster split in Envoy.
+      # Envoy: routes[].route.weighted_clusters[{name: ..., weight: 90}, {name: ..., weight: 10}]
+      # NOTE: v1 and v2 must be separate Kubernetes Services because HTTPRoute backendRefs
+      # point to Services, not to pod-label subsets. This is a key limitation vs Istio's
+      # DestinationRule subsets which can route to labeled pod groups within one Service.
+      backendRefs:
+        - name: my-svc           # stable v1 backend (Kubernetes Service in namespace: app)
+          port: 8080
+          weight: 90             # 90% of requests matching this rule go to stable
+        - name: my-svc-v2        # canary v2 backend (separate Kubernetes Service)
+          port: 8080
+          weight: 10             # 10% of requests matching this rule go to canary
+
+      # WHAT GATEWAY API CANNOT EXPRESS HERE:
+      # - No retries field (GEP-713 BackendLBPolicy covers LB only; retry policy attachment
+      #   is not in the spec as of 2025 and not implemented by most controllers)
+      # - No circuit breaker (outlierDetection, connectionPool) — no equivalent resource
+      # - No fault injection (delay/abort) — no equivalent field
+      # - No traffic mirroring — no equivalent in this version (v1alpha2 had some support)
+
+    # RULE 2: Default rule — matches /api path only (no header requirement).
+    # All other /api traffic (without x-canary header) goes 100% to stable.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api
+
+      backendRefs:
+        - name: my-svc
+          port: 8080
+          weight: 100
+
+# Status (set by controller — shown for reference):
+# status:
+#   parents:
+#     - parentRef:
+#         group: gateway.networking.k8s.io
+#         kind: Gateway
+#         name: shared-ingress-gateway
+#         namespace: infra
+#         sectionName: http
+#       controllerName: istio.io/gateway-controller
+#       conditions:
+#         - type: Accepted
+#           status: "True"           # "False" with reason: RefNotPermitted if ReferenceGrant missing
+#         - type: ResolvedRefs
+#           status: "True"           # "False" if my-svc or my-svc-v2 Service not found
