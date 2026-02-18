@@ -58,7 +58,7 @@ Expected: Two entries - "kubectl-client-side-apply" (Update) and "alice" (Apply)
 kubectl apply --server-side --field-manager=bob -f lab/deploy-bob.yaml
 ```
 
-**What's happening**: deploy-bob.yaml sets different values (e.g., replicas: 5 instead of 3). Bob tries to claim fields owned by alice. The API server detects conflict and returns 409.
+**What's happening**: deploy-bob.yaml sets different values (e.g., replicas: 2 instead of 1). Bob tries to claim fields owned by alice. The API server detects conflict and returns 409.
 
 **Observe**: Command fails with conflict error listing which fields and which manager.
 
@@ -84,7 +84,7 @@ kubectl apply --server-side --field-manager=bob --force-conflicts -f lab/deploy-
 ```bash
 # Check replicas changed
 kubectl get deploy ssa-demo -o jsonpath='{.spec.replicas}'
-# Should be 5 now
+# Should be 2 now
 
 # Inspect ownership distribution
 kubectl get deploy ssa-demo -o json | jq '.metadata.managedFields[] | select(.manager == "alice" or .manager == "bob") | {manager, fields: .fieldsV1}'

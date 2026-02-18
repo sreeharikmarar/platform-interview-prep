@@ -1,6 +1,6 @@
 # Lab: Traffic Management Internals — Priority Failover & Outlier Detection
 
-This lab demonstrates Envoy's priority-based load balancing and active health checking using a static bootstrap config. You will observe how Envoy routes all traffic to a P0 (primary) cluster, detects endpoint failure via active HTTP health checks, and spills over to a P1 (failover) cluster — then recovers when the primary comes back. You will read cluster state and health metrics directly from the admin API throughout, which is the same skill needed to debug Istio, Contour, or any Envoy-based proxy in production.
+This lab demonstrates Envoy's priority-based load balancing and active health checking using a static bootstrap config. You will observe how Envoy routes all traffic to a P0 (primary) endpoint group, detects endpoint failure via active HTTP health checks, and automatically spills over to a P1 (failover) endpoint group — then recovers when the primary comes back. You will read cluster state and health metrics directly from the admin API throughout, which is the same skill needed to debug Istio, Contour, or any Envoy-based proxy in production.
 
 ## Prerequisites
 
@@ -47,12 +47,14 @@ docker run --rm -d \
 **What's happening**: Envoy starts with `envoy-priority.yaml`. The config defines:
 
 - **Listener** on `0.0.0.0:10000` — accepts inbound HTTP connections
-- **Route** using `weighted_clusters`: `primary` at weight 100, `failover` at weight 0. All traffic normally goes to `primary`.
-- **Cluster `primary`** — `STRICT_DNS` pointing to `host.docker.internal:18081`. Has an active HTTP health check: 2 second interval, 1 second timeout, 1 failure marks unhealthy, 1 success marks healthy again.
-- **Cluster `failover`** — `STRICT_DNS` pointing to `host.docker.internal:18082`. No active health check configured; used as a static destination when the route shifts weight.
+- **Route** sending all traffic to a single cluster named `backend`
+- **Cluster `backend`** — `STRICT_DNS` with two endpoint groups inside a single `load_assignment`:
+  - `priority: 0` pointing to `host.docker.internal:18081` (upA — the primary)
+  - `priority: 1` pointing to `host.docker.internal:18082` (upB — the failover)
+- **Active health check** on the cluster: 2 second interval, 1 second timeout, 1 failure marks unhealthy, 1 success marks healthy again
 - **Admin interface** on `0.0.0.0:9901`
 
-The weight=0 on the failover cluster means Envoy's router allocates it zero share of new requests under normal conditions. When the primary cluster has no healthy endpoints, Envoy's priority spillover logic re-evaluates and routes to the next available priority tier.
+Priority failover works **within a single cluster**: when all P0 endpoints are unhealthy (`membership_healthy == 0` for priority 0), Envoy's priority load balancer automatically promotes P1 endpoints into the active rotation. This is an in-process decision — no control plane involvement required.
 
 **Verification**:
 ```bash
@@ -81,10 +83,10 @@ curl -s http://localhost:9901/clusters
 <cluster_name>::<field>::<value>
 ```
 
-Look for these fields in the `primary` cluster section:
+Look for these fields in the `backend` cluster section:
 
 ```bash
-curl -s http://localhost:9901/clusters | grep "^primary::"
+curl -s http://localhost:9901/clusters | grep "^backend::"
 ```
 
 Key fields to read:
@@ -105,7 +107,7 @@ Health flag values:
 | `/failed_active_hc` | Active health check failed — endpoint excluded from LB |
 | `/pending_active_hc` | Health check has not yet returned a result (startup window) |
 
-**Observe**: At baseline, `primary::membership_healthy` should be `1` and `primary::health_flags` for the endpoint should show `/healthy`. The `failover` cluster has no active health check, so its endpoint will also show `/healthy` by default.
+**Observe**: At baseline, the P0 endpoint (`18081`) should show `/healthy` and the P1 endpoint (`18082`) should also show `/healthy`. Both are reachable. Envoy uses P0 exclusively until P0 is exhausted.
 
 ---
 
@@ -114,14 +116,14 @@ Health flag values:
 Before inducing failure, record the baseline stats so you can see what changes during failover.
 
 ```bash
-# Health check stats for the primary cluster
-curl -s http://localhost:9901/stats | grep "cluster.primary.health_check"
+# Health check stats for the backend cluster
+curl -s http://localhost:9901/stats | grep "cluster.backend.health_check"
 
 # Current membership counts
-curl -s http://localhost:9901/stats | grep -E "cluster\.(primary|failover)\.membership"
+curl -s http://localhost:9901/stats | grep "cluster.backend.membership"
 
 # Upstream request counts
-curl -s http://localhost:9901/stats | grep -E "cluster\.(primary|failover)\.upstream_rq_total"
+curl -s http://localhost:9901/stats | grep "cluster.backend.upstream_rq_total"
 ```
 
 **What's happening**: Envoy emits stats in the format `cluster.<name>.<stat_name>: <value>`. The health check counters increment as Envoy runs its background probes:
@@ -137,7 +139,7 @@ curl -s http://localhost:9901/stats | grep -E "cluster\.(primary|failover)\.upst
 Generate a few requests to populate `upstream_rq_total`:
 ```bash
 for i in $(seq 1 5); do curl -s http://localhost:10000 > /dev/null; done
-curl -s http://localhost:9901/stats | grep "cluster.primary.upstream_rq_total"
+curl -s http://localhost:9901/stats | grep "cluster.backend.upstream_rq_total"
 ```
 
 ---
@@ -148,7 +150,7 @@ curl -s http://localhost:9901/stats | grep "cluster.primary.upstream_rq_total"
 docker stop upA
 ```
 
-Wait for Envoy's health check to detect the failure. With `interval: 2s` and `unhealthy_threshold: 1`, Envoy needs at most one failed probe cycle to mark the endpoint unhealthy. Wait 3-4 seconds to be safe:
+Wait for Envoy's health check to detect the failure. With `interval: 2s` and `unhealthy_threshold: 1`, Envoy needs at most one failed probe cycle to mark the P0 endpoint unhealthy. Wait 3-4 seconds to be safe:
 
 ```bash
 sleep 4
@@ -160,52 +162,49 @@ curl http://localhost:10000
 # Expected: failover
 ```
 
-**What's happening**: Envoy's background health checker sent an HTTP GET to `host.docker.internal:18081`. The connection was refused (upA is stopped). The health check failed. With `unhealthy_threshold: 1`, one failure is enough to mark the endpoint `/failed_active_hc`. The `primary` cluster now has `membership_healthy: 0`.
+**What's happening**: Envoy's background health checker sent an HTTP GET to `host.docker.internal:18081`. The connection was refused (upA is stopped). The health check failed. With `unhealthy_threshold: 1`, one failure is enough to mark the P0 endpoint `/failed_active_hc`. The priority-0 endpoint group now has `membership_healthy: 0` for its tier.
 
-With P0 having zero healthy endpoints, Envoy's priority load balancer spills over to P1 — the `failover` cluster. The weighted_clusters route still sends 100 weight to `primary` and 0 to `failover`, but Envoy's priority failover overrides the weight distribution when the higher-priority tier is exhausted.
+With P0 exhausted, Envoy's priority load balancer automatically promotes the P1 endpoint group (`host.docker.internal:18082`) into active rotation. This happens in-process — no control plane involved.
 
 **Verification**:
 ```bash
-# Confirm health state changed
-curl -s http://localhost:9901/clusters | grep "^primary::"
+# Confirm health state changed for the P0 endpoint
+curl -s http://localhost:9901/clusters | grep "^backend::"
 
-# Look for: primary::health_flags::host.docker.internal/18081::failed_active_hc
-# and:      primary::membership_healthy::0
+# Look for: backend::health_flags::host.docker.internal/18081::failed_active_hc
+# and:      backend::membership_healthy::1  (P1 endpoint is still healthy)
 ```
 
 ---
 
 ### 6. Inspect stats during failover
 
-With the primary down and traffic flowing to failover, read the stats to confirm what Envoy is tracking:
+With the P0 endpoint down and traffic flowing to P1, read the stats to confirm what Envoy is tracking:
 
 ```bash
 # Health check failure counter should have incremented
-curl -s http://localhost:9901/stats | grep "cluster.primary.health_check"
+curl -s http://localhost:9901/stats | grep "cluster.backend.health_check"
 
-# membership_healthy should now be 0 for primary
-curl -s http://localhost:9901/stats | grep "cluster.primary.membership_healthy"
-
-# upstream_rq_total should be incrementing on the failover cluster
-curl -s http://localhost:9901/stats | grep -E "cluster\.(primary|failover)\.upstream_rq_total"
+# upstream_rq_total continues growing — same cluster name, different priority tier serving
+curl -s http://localhost:9901/stats | grep "cluster.backend.upstream_rq_total"
 ```
 
-Send more requests and watch the failover counter grow while the primary counter holds:
+Send more requests and watch the total grow:
 
 ```bash
 for i in $(seq 1 5); do curl -s http://localhost:10000; done
-curl -s http://localhost:9901/stats | grep -E "cluster\.(primary|failover)\.upstream_rq_total"
+curl -s http://localhost:9901/stats | grep "cluster.backend.upstream_rq_total"
 ```
 
-**What's happening**: `cluster.primary.health_check.failure` increments each time the health check probe cannot reach upA. `cluster.failover.upstream_rq_total` increments for each user request that was rerouted. This is the exact signal you would alert on in production: a non-zero and growing `health_check.failure` combined with a drop in `membership_healthy` to zero indicates a cluster is fully down.
+**What's happening**: Because priority failover is within a single cluster, all requests are counted under `cluster.backend.*` regardless of which priority tier is serving. `health_check.failure` increments each time the probe cannot reach the P0 endpoint. This is the signal to alert on in production: non-zero and growing `health_check.failure` combined with a P0 tier at `membership_healthy: 0` indicates the primary tier is fully down.
 
-**Observe**: Note that Envoy continues probing upA even while it is marked unhealthy. This is how it will detect recovery — the active health check is always running in the background.
+**Observe**: Envoy continues probing the P0 endpoint even while it is marked unhealthy. This is how it detects recovery — the active health check runs in the background continuously.
 
 ---
 
 ### 7. Restore the primary and observe failback
 
-`--rm` containers are deleted on stop, so you need to re-launch upA with the same name and port:
+`--rm` containers are deleted on stop, so re-launch upA with the same name and port:
 
 ```bash
 docker run --rm -d --name upA -p 18081:80 hashicorp/http-echo -text="primary"
@@ -224,32 +223,29 @@ curl http://localhost:10000
 # Expected: primary
 ```
 
-**What's happening**: Envoy's background health check sent a probe to `host.docker.internal:18081` and received a 200 response. With `healthy_threshold: 1`, one success is enough. The endpoint transitions from `/failed_active_hc` back to `/healthy`. `membership_healthy` returns to 1. The priority LB now has a healthy P0 tier and routes traffic back to `primary` exclusively.
+**What's happening**: Envoy's background health check sent a probe to `host.docker.internal:18081` and received a 200 response. With `healthy_threshold: 1`, one success is enough. The P0 endpoint transitions from `/failed_active_hc` back to `/healthy`. The priority load balancer now has a healthy P0 tier and routes traffic back to the primary endpoint exclusively.
 
 **Verification**:
 ```bash
-# Confirm endpoint is healthy again
-curl -s http://localhost:9901/clusters | grep "^primary::"
+# Confirm P0 endpoint is healthy again
+curl -s http://localhost:9901/clusters | grep "^backend::"
 # Look for: health_flags::host.docker.internal/18081::/healthy
 
 # Health check success counter should have incremented
-curl -s http://localhost:9901/stats | grep "cluster.primary.health_check.success"
-
-# Traffic should have returned to primary cluster
-curl -s http://localhost:9901/stats | grep -E "cluster\.(primary|failover)\.upstream_rq_total"
+curl -s http://localhost:9901/stats | grep "cluster.backend.health_check.success"
 ```
 
 ---
 
 ### 8. Watch health check timing in real time
 
-Envoy emits an access log entry on the admin port for each health check probe (routed to `/tmp/admin_access.log` inside the container). You can observe the probe cadence directly by watching the `health_check.attempt` stat increment over time:
+Envoy emits an access log entry on the admin port for each health check probe. You can observe the probe cadence by watching the `health_check.attempt` stat increment over time:
 
 ```bash
 # Poll the attempt counter every 2 seconds for 12 seconds
 for i in $(seq 1 6); do
   echo -n "t=$((i*2))s attempt="
-  curl -s http://localhost:9901/stats | grep "cluster.primary.health_check.attempt" | awk '{print $2}'
+  curl -s http://localhost:9901/stats | grep "cluster.backend.health_check.attempt" | awk '{print $2}'
   sleep 2
 done
 ```
@@ -267,10 +263,10 @@ Verify that the priority settings and health check config were parsed correctly:
 ```bash
 # Extract cluster config from config_dump
 curl -s http://localhost:9901/config_dump \
-  | jq '.configs[] | select(.["@type"] | contains("ClustersConfigDump")) | .static_clusters[] | .cluster | {name: .name, health_checks: .health_checks, load_assignment: .load_assignment}'
+  | jq '.configs[] | select(.["@type"] | contains("ClustersConfigDump")) | .static_clusters[0].cluster | {name: .name, health_checks: .health_checks, load_assignment: .load_assignment}'
 ```
 
-**What's happening**: The `config_dump` endpoint shows Envoy's internal proto representation of all configured objects. The `load_assignment.endpoints[].priority` field shows the priority level assigned to each endpoint group. In the `primary` cluster, `priority: 0` is the highest priority. In the `failover` cluster, `priority: 1` is the next tier.
+**What's happening**: The `config_dump` endpoint shows Envoy's internal proto representation of all configured objects. The `load_assignment.endpoints[].priority` field shows the priority level assigned to each endpoint group within the `backend` cluster: `priority: 0` for the primary endpoint and `priority: 1` for the failover endpoint. Both live inside the same cluster — this is what makes automatic priority spillover possible.
 
 This is particularly useful in xDS-managed environments (Istio, Contour) where the config you declared in a CRD may have been transformed significantly before reaching Envoy — the config dump shows what Envoy actually received.
 
@@ -293,14 +289,16 @@ docker ps -a | grep -E "envoy|upA|upB"
 
 ## Key Takeaways
 
-1. **Active health checks are cluster-level, not route-level**: The health check config lives on the cluster object. Envoy probes each endpoint independently on the configured interval. The route only controls how requests are distributed across clusters — the cluster's own health check state controls which endpoints within that cluster are eligible.
+1. **Priority failover operates within a single cluster, not across clusters**: The `load_assignment.endpoints` array inside one cluster can contain multiple endpoint groups, each with a different `priority` value. When all endpoints at priority N are unhealthy, Envoy automatically promotes priority N+1 endpoints. Two separate clusters with a static route cannot replicate this behavior.
 
-2. **Priority spillover is automatic when healthy endpoints are exhausted**: When a cluster's `membership_healthy` drops to zero, Envoy's priority load balancer promotes the next priority tier (P1, then P2, etc.) into the active set. This happens inside Envoy without any control plane involvement — it is a local, in-process decision.
+2. **Active health checks are cluster-level, not route-level**: The health check config lives on the cluster object. Envoy probes each endpoint independently on the configured interval. The route only controls which cluster receives requests — the cluster's own health check state controls which endpoints within that cluster are eligible.
 
-3. **`healthy_threshold` and `unhealthy_threshold` control hysteresis**: Setting these to 1 means one probe result flips the endpoint state immediately. In production, set `unhealthy_threshold: 2` or `3` to avoid flapping on transient timeouts, and `healthy_threshold: 2` to ensure recovery is stable before returning traffic.
+3. **Priority spillover is automatic when healthy endpoints are exhausted**: When a priority tier's `membership_healthy` drops to zero, Envoy's priority load balancer promotes the next priority tier into the active set. This happens inside Envoy without any control plane involvement — it is a local, in-process decision.
 
-4. **The admin `/clusters` endpoint is the ground truth for endpoint health**: In any Envoy-based system (Istio sidecar, ingress gateway, Contour, etc.), `curl http://localhost:15000/clusters` (port 15000 in Istio) shows you whether Envoy actually considers your backends up. A pod can be `Running` and `Ready` from Kubernetes' perspective while Envoy marks it `/failed_active_hc` — these health systems are independent.
+4. **`healthy_threshold` and `unhealthy_threshold` control hysteresis**: Setting these to 1 means one probe result flips the endpoint state immediately. In production, set `unhealthy_threshold: 2` or `3` to avoid flapping on transient timeouts, and `healthy_threshold: 2` to ensure recovery is stable before returning traffic.
 
-5. **Stats counters tell the story of what happened**: `health_check.failure` increments on every failed probe; `membership_healthy` is a gauge that reflects the current count. Alerting on `membership_healthy == 0` for a production cluster is more reliable than alerting on individual probe failures, since a single missed probe under load is not unusual.
+5. **The admin `/clusters` endpoint is the ground truth for endpoint health**: In any Envoy-based system (Istio sidecar, ingress gateway, Contour, etc.), `curl http://localhost:15000/clusters` (port 15000 in Istio) shows you whether Envoy actually considers your backends up. A pod can be `Running` and `Ready` from Kubernetes' perspective while Envoy marks it `/failed_active_hc` — these health systems are independent.
 
-6. **Failback is governed by `healthy_threshold`, not by traffic**: Envoy does not use a gradual canary approach during failback. Once the endpoint accumulates `healthy_threshold` consecutive successful probes, it immediately re-enters full rotation. If you want gradual failback, use outlier detection with `base_ejection_time` alongside health checks — outlier detection manages ejection duration while health checks manage initial reachability.
+6. **Stats counters tell the story of what happened**: `health_check.failure` increments on every failed probe; `membership_healthy` is a gauge that reflects the current count. Alerting on `membership_healthy == 0` for a production cluster is more reliable than alerting on individual probe failures, since a single missed probe under load is not unusual.
+
+7. **Failback is governed by `healthy_threshold`, not by traffic**: Envoy does not use a gradual canary approach during failback. Once the endpoint accumulates `healthy_threshold` consecutive successful probes, it immediately re-enters full rotation. If you want gradual failback, use outlier detection with `base_ejection_time` alongside health checks — outlier detection manages ejection duration while health checks manage initial reachability.

@@ -16,18 +16,12 @@ static_resources:
               domains: ["*"]
               routes:
               - match: { prefix: "/" }
-                route:
-                  weighted_clusters:
-                    clusters:
-                    - name: primary
-                      weight: 100
-                    - name: failover
-                      weight: 0
+                route: { cluster: backend }
           http_filters:
           - name: envoy.filters.http.router
-            typed_config: { "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.HttpConnectionManager }
+            typed_config: { "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router }
   clusters:
-  - name: primary
+  - name: backend
     connect_timeout: 0.25s
     type: STRICT_DNS
     lb_policy: ROUND_ROBIN
@@ -38,20 +32,13 @@ static_resources:
       healthy_threshold: 1
       http_health_check: { path: "/" }
     load_assignment:
-      cluster_name: primary
+      cluster_name: backend
       endpoints:
       - priority: 0
         lb_endpoints:
         - endpoint:
             address:
               socket_address: { address: host.docker.internal, port_value: 18081 }
-  - name: failover
-    connect_timeout: 0.25s
-    type: STRICT_DNS
-    lb_policy: ROUND_ROBIN
-    load_assignment:
-      cluster_name: failover
-      endpoints:
       - priority: 1
         lb_endpoints:
         - endpoint:
