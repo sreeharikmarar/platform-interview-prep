@@ -1,0 +1,106 @@
+# Docker Compose file for inference gateway lab backends
+# Simulates two model versions with different response latencies
+#
+# Usage:
+#   docker compose -f backend-deploy.yaml up -d
+#   curl http://localhost:8081/inference  # fast model (100ms)
+#   curl http://localhost:8082/inference  # slow model (500ms)
+
+services:
+  model-v1:
+    image: python:3.11-slim
+    container_name: model-v1
+    ports:
+      - "8081:8080"
+    environment:
+      - DELAY_MS=100
+      - MODEL_VERSION=v1
+      - MODEL_NAME=llama-3-8b-v1
+    command: >
+      python3 -c "
+      import http.server, json, time, os, socketserver
+
+      DELAY = int(os.environ.get('DELAY_MS', 100)) / 1000.0
+      VERSION = os.environ.get('MODEL_VERSION', 'v1')
+      MODEL = os.environ.get('MODEL_NAME', 'unknown')
+
+      class Handler(http.server.BaseHTTPRequestHandler):
+          def do_GET(self):
+              time.sleep(DELAY)
+              response = json.dumps({
+                  'model': MODEL,
+                  'version': VERSION,
+                  'latency_ms': int(DELAY * 1000),
+                  'tokens_generated': 42,
+                  'status': 'ok'
+              })
+              self.send_response(200)
+              self.send_header('Content-Type', 'application/json')
+              self.send_header('X-Model-Version', VERSION)
+              self.end_headers()
+              self.wfile.write(response.encode())
+
+          def do_POST(self):
+              self.do_GET()
+
+          def log_message(self, format, *args):
+              pass  # suppress request logs
+
+      with socketserver.TCPServer(('', 8080), Handler) as httpd:
+          print(f'Model {MODEL} ({VERSION}) serving on port 8080 with {int(DELAY*1000)}ms delay')
+          httpd.serve_forever()
+      "
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  model-v2:
+    image: python:3.11-slim
+    container_name: model-v2
+    ports:
+      - "8082:8080"
+    environment:
+      - DELAY_MS=500
+      - MODEL_VERSION=v2
+      - MODEL_NAME=llama-3-8b-v2
+    command: >
+      python3 -c "
+      import http.server, json, time, os, socketserver
+
+      DELAY = int(os.environ.get('DELAY_MS', 500)) / 1000.0
+      VERSION = os.environ.get('MODEL_VERSION', 'v2')
+      MODEL = os.environ.get('MODEL_NAME', 'unknown')
+
+      class Handler(http.server.BaseHTTPRequestHandler):
+          def do_GET(self):
+              time.sleep(DELAY)
+              response = json.dumps({
+                  'model': MODEL,
+                  'version': VERSION,
+                  'latency_ms': int(DELAY * 1000),
+                  'tokens_generated': 128,
+                  'status': 'ok'
+              })
+              self.send_response(200)
+              self.send_header('Content-Type', 'application/json')
+              self.send_header('X-Model-Version', VERSION)
+              self.end_headers()
+              self.wfile.write(response.encode())
+
+          def do_POST(self):
+              self.do_GET()
+
+          def log_message(self, format, *args):
+              pass
+
+      with socketserver.TCPServer(('', 8080), Handler) as httpd:
+          print(f'Model {MODEL} ({VERSION}) serving on port 8080 with {int(DELAY*1000)}ms delay')
+          httpd.serve_forever()
+      "
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3

@@ -1,0 +1,195 @@
+# stress-deploy.yaml
+#
+# Creates the RBAC resources and a batch Job that generates bulk API server write load.
+# The Job creates 50 namespaces (ns-stress-001 through ns-stress-050) and 5 ConfigMaps
+# in each namespace, for a total of 300 individual API server write transactions.
+#
+# Apply with: kubectl apply -f stress-deploy.yaml
+# Monitor:    kubectl get jobs -n default -w
+# Logs:       kubectl logs -n default -l job-name=stress-writer -f
+# Cleanup:    kubectl delete -f stress-deploy.yaml && kubectl get ns -o name | grep ns-stress | xargs kubectl delete
+#
+---
+# ServiceAccount used by the Job pods.
+# Using a dedicated ServiceAccount (not default) allows precise RBAC scoping
+# and makes audit logs easy to filter by serviceAccount name.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: stress-writer
+  namespace: default
+  labels:
+    app.kubernetes.io/part-of: cp-scale-lab
+    app.kubernetes.io/component: stress-workload
+---
+# ClusterRole granting the minimum permissions the stress script needs.
+# Namespaces are cluster-scoped, so the role must be a ClusterRole.
+# ConfigMaps are namespaced, but we need to create them in namespaces that do not
+# exist yet at role-binding time, so we use a ClusterRole with wildcard namespace
+# access (enforced via ClusterRoleBinding, not RoleBinding).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: stress-writer
+  labels:
+    app.kubernetes.io/part-of: cp-scale-lab
+    app.kubernetes.io/component: stress-workload
+rules:
+  # Permission to create and delete the stress namespaces
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["create", "delete", "get", "list"]
+  # Permission to create ConfigMaps in any namespace (needed because the stress
+  # namespaces are created dynamically and do not exist at binding time)
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "delete", "get", "list"]
+---
+# ClusterRoleBinding ties the stress-writer ServiceAccount to the ClusterRole above.
+# The subject is the ServiceAccount in the 'default' namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: stress-writer
+  labels:
+    app.kubernetes.io/part-of: cp-scale-lab
+    app.kubernetes.io/component: stress-workload
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: stress-writer
+subjects:
+  - kind: ServiceAccount
+    name: stress-writer
+    namespace: default
+---
+# Batch Job that runs the stress script.
+#
+# Design choices:
+#   - backoffLimit: 0 — if the script fails we want to see the error immediately,
+#     not retry and create partial resources in an inconsistent state.
+#   - activeDeadlineSeconds: 300 — kill the Job if it runs longer than 5 minutes;
+#     prevents it from running indefinitely if the cluster is overloaded.
+#   - kubectl image from bitnami/kubectl — a minimal image containing only kubectl.
+#     In a restricted registry environment, replace with your internal mirror.
+#   - The script uses sequential (not parallel) creates to keep the write rate
+#     controlled and observable. For a higher-intensity stress test, remove the
+#     inner loop nesting and use xargs -P for parallel execution.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: stress-writer
+  namespace: default
+  labels:
+    app.kubernetes.io/part-of: cp-scale-lab
+    app.kubernetes.io/component: stress-workload
+spec:
+  # Do not retry on failure — we want clean failure visibility
+  backoffLimit: 0
+  # Kill the job after 5 minutes regardless of progress
+  activeDeadlineSeconds: 300
+  # Retain the completed pod for log inspection (default is to delete immediately)
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: cp-scale-lab
+        app.kubernetes.io/component: stress-workload
+        job-name: stress-writer
+    spec:
+      # Use the ServiceAccount we created above — this is what the API server
+      # will authenticate as when the kubectl commands run inside the container.
+      serviceAccountName: stress-writer
+
+      # Never restart the pod on failure (consistent with backoffLimit: 0)
+      restartPolicy: Never
+
+      containers:
+        - name: stress
+          # bitnami/kubectl provides a minimal image with kubectl pre-installed.
+          # The tag matches a recent Kubernetes release; adjust to match your cluster.
+          image: bitnami/kubectl:1.28
+          imagePullPolicy: IfNotPresent
+
+          # The stress script runs inline as a shell command.
+          # Structure:
+          #   outer loop: iterate over 50 namespace indices (zero-padded to 3 digits)
+          #   inner step 1: create the namespace
+          #   inner step 2: create 5 ConfigMaps in that namespace with distinct data payloads
+          #   progress logging: print the namespace name and elapsed time to stdout
+          #
+          # The ConfigMap data includes a 512-byte payload to make each write
+          # more representative of real-world ConfigMap sizes (not just empty objects).
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -euo pipefail
+
+              START_TIME=$(date +%s)
+              NAMESPACE_COUNT=50
+              CONFIGMAPS_PER_NS=5
+
+              echo "Starting stress writer: ${NAMESPACE_COUNT} namespaces x ${CONFIGMAPS_PER_NS} ConfigMaps each"
+              echo "Total API write operations: $((NAMESPACE_COUNT + NAMESPACE_COUNT * CONFIGMAPS_PER_NS))"
+
+              for i in $(seq 1 ${NAMESPACE_COUNT}); do
+                # Zero-pad the index to 3 digits for lexicographic sorting (001, 002, ... 050)
+                NS=$(printf "ns-stress-%03d" $i)
+
+                # Create the namespace — this is a cluster-scoped write to etcd.
+                # Each namespace creation triggers: admission, etcd write, watch fan-out.
+                kubectl create namespace "${NS}" \
+                  --dry-run=none \
+                  2>&1 | grep -v "already exists" || true
+
+                # Create ConfigMaps in the new namespace.
+                # Each ConfigMap has a data payload to exercise etcd value size handling.
+                for j in $(seq 1 ${CONFIGMAPS_PER_NS}); do
+                  kubectl create configmap "stress-cm-${j}" \
+                    --namespace="${NS}" \
+                    --from-literal="key-a=value-$(date +%s%N)-${i}-${j}" \
+                    --from-literal="key-b=payload-$(head -c 256 /dev/urandom | base64 | tr -d '\n' | head -c 256)" \
+                    --from-literal="namespace=${NS}" \
+                    --from-literal="index=${j}" \
+                    2>&1 | grep -v "already exists" || true
+                done
+
+                # Progress report every 10 namespaces
+                if [ $((i % 10)) -eq 0 ]; then
+                  ELAPSED=$(( $(date +%s) - START_TIME ))
+                  echo "Progress: ${i}/${NAMESPACE_COUNT} namespaces created (${ELAPSED}s elapsed)"
+                fi
+              done
+
+              END_TIME=$(date +%s)
+              TOTAL_ELAPSED=$(( END_TIME - START_TIME ))
+              TOTAL_WRITES=$((NAMESPACE_COUNT + NAMESPACE_COUNT * CONFIGMAPS_PER_NS))
+              echo "Done: ${TOTAL_WRITES} objects created in ${TOTAL_ELAPSED}s"
+              echo "Average write rate: $(( TOTAL_WRITES / TOTAL_ELAPSED )) objects/sec"
+
+          # Resource limits keep the stress Job from interfering with the
+          # kind node itself. kubectl is not CPU or memory intensive.
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+
+          # Security context: run as a non-root user.
+          # The bitnami/kubectl image runs as UID 1001 by default.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false  # kubectl writes to /tmp for caching
+            capabilities:
+              drop: ["ALL"]
+
+      # Pod-level security context
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault

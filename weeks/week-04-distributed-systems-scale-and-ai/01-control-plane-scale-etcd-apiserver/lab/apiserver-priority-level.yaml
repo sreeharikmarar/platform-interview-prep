@@ -1,0 +1,185 @@
+# apiserver-priority-level.yaml
+#
+# Defines a custom API Priority and Fairness (APF) configuration for platform controllers.
+#
+# API Priority and Fairness (APF) replaces the older --max-requests-inflight flag with a
+# per-flow concurrency model. Every API server request is classified by a FlowSchema into
+# a PriorityLevelConfiguration, which defines how many concurrent "seats" that class of
+# request may consume.
+#
+# This manifest creates:
+#   1. PriorityLevelConfiguration "platform-controllers"
+#      - type: Limited — has a finite concurrency budget (use Exempt for health probes/admin)
+#      - nominalConcurrencyShares: 40 — relative weight in the total server concurrency pool
+#      - queuing enabled with 64 queues and a queue length of 50
+#
+#   2. FlowSchema "platform-controllers"
+#      - matches requests from any ServiceAccount in the "platform-system" namespace
+#      - assigns matched requests to the "platform-controllers" PriorityLevel
+#      - matchingPrecedence: 900 — evaluated after built-in system schemas (precedence < 200)
+#        but before the catch-all global-default (precedence 10000)
+#
+# API versions:
+#   - flowcontrol.apiserver.k8s.io/v1 is stable and GA in Kubernetes 1.29+
+#   - flowcontrol.apiserver.k8s.io/v1beta3 is available in Kubernetes 1.26-1.28
+#   - Use v1beta3 if your cluster is on 1.28 and the v1 API is not yet available
+#
+# Apply with: kubectl apply -f apiserver-priority-level.yaml
+# Verify:     kubectl get prioritylevelconfigurations platform-controllers
+#             kubectl get flowschemas platform-controllers
+# Metrics:    curl -s http://localhost:8001/metrics | grep apiserver_flowcontrol | grep platform
+#
+---
+# PriorityLevelConfiguration defines the concurrency budget for this class of requests.
+#
+# How seats are calculated:
+#   totalServerConcurrency = a function of --max-requests-inflight (default: 400)
+#   seatsForThisLevel = floor(nominalConcurrencyShares / sumOfAllActiveShares * totalServerConcurrency)
+#
+# With default built-in levels totaling ~360 shares, adding 40 here means:
+#   platform-controllers gets: 40 / 400 * 400 = ~40 concurrent seats
+#   (actual calculation is more nuanced — the API server rebalances on active levels)
+#
+# References:
+#   https://kubernetes.io/docs/concepts/cluster-administration/flow-control/
+apiVersion: flowcontrol.apiserver.k8s.io/v1
+kind: PriorityLevelConfiguration
+metadata:
+  name: platform-controllers
+  labels:
+    app.kubernetes.io/part-of: cp-scale-lab
+    app.kubernetes.io/component: apf-config
+  annotations:
+    # Document the intent: this level isolates platform controller traffic from
+    # tenant and CI workloads. Prevents a runaway operator from starving kube-system.
+    description: "Dedicated concurrency pool for platform controllers in platform-system namespace"
+spec:
+  # Limited: this level has a finite seat budget, with optional queuing.
+  # The alternative is Exempt (used for health probes and cluster-admin bypass),
+  # which has no limit and no queuing — never use Exempt for controller traffic.
+  type: Limited
+  limited:
+    # nominalConcurrencyShares: the relative weight of this priority level.
+    # This is NOT an absolute count — it is proportional to the sum of all active levels.
+    # 40 shares ≈ 10% of default server concurrency (assuming ~400 total shares active).
+    # Production guidance: size this to your controller's typical burst width.
+    # kube-controller-manager uses ~200 shares; system-cluster-critical uses ~1400 shares.
+    nominalConcurrencyShares: 40
+
+    # lendablePercent: percentage of nominal seats this level may lend to other levels
+    # when its own queues are empty. Default is 0 (no lending). Setting 50% means
+    # up to 20 seats can be borrowed by other levels when platform-controllers is idle.
+    # This improves overall cluster utilization without compromising burst capacity.
+    lendablePercent: 50
+
+    # borrowingLimitPercent: how much above nominal this level may borrow from idle levels.
+    # Null means it may borrow up to its nominal shares worth of extra seats.
+    # Setting 0 means no borrowing — strict isolation at the cost of lower utilization.
+    borrowingLimitPercent: 25
+
+    limitResponse:
+      # Queue requests that exceed the nominal concurrency rather than rejecting them.
+      # This is appropriate for controllers that can tolerate latency but not errors.
+      # Use type: Reject if you want strict rate limiting with no buffering.
+      type: Queue
+      queuing:
+        # queues: number of independent queues for shuffle sharding.
+        # Shuffle sharding limits the blast radius when a single flow is misbehaving:
+        # a flow is assigned to sqrt(queues) queues deterministically based on its
+        # flow distinguisher. 64 queues is the recommended value for most use cases.
+        queues: 64
+
+        # handSize: how many queues each flow is hashed to (shuffle shard width).
+        # Must be <= queues. Kubernetes default is 6.
+        # With 64 queues and handSize 6, a single misbehaving flow can displace
+        # at most 6/64 = 9.4% of queue capacity.
+        handSize: 6
+
+        # queueLengthLimit: maximum requests that may wait in a single queue.
+        # Total buffer = queues * queueLengthLimit = 64 * 50 = 3200 requests.
+        # Requests arriving when their queue is full are rejected with HTTP 429.
+        queueLengthLimit: 50
+---
+# FlowSchema classifies incoming requests and assigns them to a PriorityLevel.
+#
+# Matching logic:
+#   1. The API server evaluates all FlowSchemas in ascending matchingPrecedence order.
+#   2. The first FlowSchema whose rules match the request wins.
+#   3. Built-in FlowSchemas have precedence 1-200; kube-system service accounts
+#      are in the 1-100 range; user-defined schemas should use 500-999 to avoid
+#      conflicts with built-in schemas.
+#   4. The catch-all "global-default" FlowSchema has precedence 10000.
+#
+# This FlowSchema matches requests from any ServiceAccount in the platform-system
+# namespace. In practice this means: platform operators, controllers, and any
+# kubectl exec sessions using the platform-system service accounts.
+apiVersion: flowcontrol.apiserver.k8s.io/v1
+kind: FlowSchema
+metadata:
+  name: platform-controllers
+  labels:
+    app.kubernetes.io/part-of: cp-scale-lab
+    app.kubernetes.io/component: apf-config
+  annotations:
+    description: "Route platform-system ServiceAccount requests to the platform-controllers priority level"
+spec:
+  # matchingPrecedence: lower number = evaluated earlier = higher effective priority.
+  # 900 places this schema after all built-in system schemas (which end around 800)
+  # but before the global-default catch-all at 10000.
+  # To verify ordering: kubectl get flowschemas --sort-by='.spec.matchingPrecedence'
+  matchingPrecedence: 900
+
+  # priorityLevelConfiguration: the PriorityLevelConfiguration this schema routes to.
+  # Must exist before or alongside this FlowSchema (apply order does not matter;
+  # the API server resolves the reference dynamically).
+  priorityLevelConfiguration:
+    name: platform-controllers
+
+  # distinguisherMethod determines what constitutes a distinct "flow" within this level.
+  # ByUser: each unique user/serviceaccount is a separate flow (good for fairness between controllers)
+  # ByNamespace: each namespace is a separate flow (good for multi-tenant isolation)
+  # Null: all requests in this level share a single flow (least isolation, simplest queuing)
+  #
+  # ByUser is correct here: each platform controller ServiceAccount gets its own
+  # queue slot, preventing one misbehaving controller from blocking others.
+  distinguisherMethod:
+    type: ByUser
+
+  # rules: the matching criteria. A request matches this FlowSchema if it matches
+  # ANY rule in this list (rules are OR'd together).
+  # Within a rule, subjects AND resourceRules are AND'd.
+  rules:
+    - subjects:
+        # Match any ServiceAccount in the platform-system namespace using the
+        # automatically-assigned group identity. Kubernetes grants every ServiceAccount
+        # membership in the group "system:serviceaccounts:<namespace>" — this is more
+        # reliable than enumerating individual ServiceAccount names and automatically
+        # covers new controllers deployed to the namespace.
+        #
+        # The FlowSchema API does NOT support wildcard ServiceAccount names
+        # (name: "*" is rejected by the API server). The Group subject kind is the
+        # correct mechanism for namespace-scoped wildcard matching.
+        - kind: Group
+          group:
+            name: "system:serviceaccounts:platform-system"
+      # resourceRules: which API requests this subject match applies to.
+      # Omitting this field (or specifying "*") matches all resources and verbs.
+      # Restricting to specific verbs reduces the scope of the APF classification
+      # and lets other FlowSchemas handle health probe traffic from the same namespace.
+      resourceRules:
+        - verbs:
+            - "get"
+            - "list"
+            - "watch"
+            - "create"
+            - "update"
+            - "patch"
+            - "delete"
+            - "deletecollection"
+          apiGroups:
+            - "*"
+          resources:
+            - "*"
+          clusterScope: true
+          namespaces:
+            - "*"
