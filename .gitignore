@@ -1,0 +1,9 @@
+# Claude Code — user-specific files (exclude)
+.claude/agent-memory/
+.claude/projects/
+.claude/*.jsonl
+.claude/settings.local.json
+
+# Claude Code — project-shared files (tracked):
+#   .claude/agents/              — agent definitions
+#   .claude/settings.json        — shared project settings
