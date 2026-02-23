@@ -23,6 +23,8 @@ Each week subfolder follows this structure:
 - `talk-tracks.md` — interview Q&A scripts (1-min answers + walkthrough)
 - `lab/README.md` — step-by-step hands-on instructions
 - `lab/*.yaml` — supporting manifests / configs
+- `lab/*.sh` — helper scripts (week-00)
+- `lab/*.md` — worksheets (week-00)
 
 ## Conventions
 - Use kebab-case for folder and file names
@@ -30,6 +32,6 @@ Each week subfolder follows this structure:
 - Write in markdown format
 
 ## Content Review Status
-All 4 weeks reviewed by an expert K8s/Envoy engineer (2026-02-18). Known corrections applied:
+Weeks 01-04 reviewed by an expert K8s/Envoy engineer (2026-02-18). Known corrections applied:
 - `week-03/.../02-traffic-management-internals/lab/envoy-priority.yaml` — rewritten to use correct single-cluster priority failover model; router filter `@type` fixed
 - `week-01/.../02-apply-ssa-and-patch-semantics/lab/README.md` — stale replica counts corrected
