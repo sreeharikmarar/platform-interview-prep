@@ -54,3 +54,30 @@ These foundations appear in nearly every platform engineering scenario:
 - Docker or containerd installed for container runtime labs
 - `kubectl` and a running cluster for CNI and IP planning exercises
 - Familiarity with basic Linux commands (`ps`, `ip`, `iptables`)
+
+## Lab Environment (macOS / non-Linux hosts)
+
+Topics 01-04 require Linux kernel features (namespaces, cgroups v2, `/proc`, iptables, `runc`, `containerd`) that are unavailable natively on macOS. A Docker-based lab container is provided with every tool pre-installed.
+
+**Quick start:**
+
+```bash
+cd weeks/week-00-linux-containers-and-cloud-networking
+
+# First time — build the image and start the container:
+./lab-start.sh --build
+
+# Subsequent runs — just start the container:
+./lab-start.sh
+```
+
+This drops you into a root shell on an Ubuntu 22.04 container with:
+- All kernel/namespace tools: `unshare`, `nsenter`, `strace`, `ip`, `iptables`, `capsh`
+- Container runtimes: `runc`, `containerd`, `ctr`, `crictl`
+- A statically-linked `busybox` (for the scratch-container lab)
+- Docker CLI connected to your host Docker daemon (via socket mount)
+- Lab scripts pre-copied to `/labs/01/` through `/labs/04/`
+
+The container runs with `--privileged` to allow cgroup writes, namespace creation, iptables rules, and overlayfs mounts.
+
+**Topic 05** (VPC/CIDR IP planning) is paper-based and does not require the lab container.

@@ -4,13 +4,21 @@ This lab walks through the container stack from the bottom up. You will inspect 
 
 ## Prerequisites
 
-- Linux host or VM (macOS does not run Linux containers natively; use a kind node or a VM)
+- Linux host or VM (macOS does not run Linux containers natively)
 - `containerd` 1.7+ installed and running (`systemctl status containerd`)
 - `ctr` installed (ships with containerd)
-- `crictl` 1.28+ installed (install: `VERSION=v1.28.0; curl -sSLo /usr/local/bin/crictl https://github.com/kubernetes-sigs/cri-tools/releases/download/${VERSION}/crictl-${VERSION}-linux-amd64.tar.gz | tar -xz -C /usr/local/bin/`)
-- `runc` installed (version ≥ 1.1; install: `apt install runc` or download from GitHub releases)
+- `crictl` 1.28+ installed
+- `runc` installed (version ≥ 1.1)
 - `jq` and `curl` available
 - Root access (most operations require root or the `containerd` group)
+
+> **macOS users**: Run the week-00 lab container — it has `containerd`, `ctr`, `crictl`, and `runc` pre-installed and running. This replaces the kind-node workaround:
+> ```bash
+> cd weeks/week-00-linux-containers-and-cloud-networking
+> ./lab-start.sh --build   # first time
+> ./lab-start.sh           # subsequent runs
+> ```
+> Inside the container, lab scripts are at `/labs/03/`. containerd starts automatically via the entrypoint.
 
 Verify all tools are present:
 ```bash
@@ -19,13 +27,6 @@ ctr version
 crictl version
 runc --version
 jq --version
-```
-
-If you are working on a macOS machine, start a kind cluster and exec into the control-plane node for the lab exercises:
-```bash
-kind create cluster --name oci-lab
-docker exec -it oci-lab-control-plane bash
-# All remaining lab commands run inside this shell
 ```
 
 ---

@@ -10,6 +10,14 @@ This lab builds hands-on intuition for the two kernel primitives that make conta
 - cgroups v2 unified hierarchy is assumed. Verify with: `cat /sys/fs/cgroup/cgroup.controllers` — if that file exists, you have cgroupsv2.
 - On Ubuntu: `sudo apt-get update && sudo apt-get install -y util-linux iproute2 curl jq cgroup-tools`
 
+> **macOS users**: Run the week-00 lab container which provides a privileged Ubuntu environment with all packages pre-installed:
+> ```bash
+> cd weeks/week-00-linux-containers-and-cloud-networking
+> ./lab-start.sh --build   # first time
+> ./lab-start.sh           # subsequent runs
+> ```
+> Inside the container, lab scripts are at `/labs/02/`. You are already root — no `sudo` needed.
+
 ```bash
 # Confirm cgroupsv2
 cat /sys/fs/cgroup/cgroup.controllers

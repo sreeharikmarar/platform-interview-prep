@@ -10,6 +10,14 @@ This lab explores the kernel mechanisms that underpin container behavior using o
 - `capsh` available for capability decoding (`apt-get install libcap2-bin`)
 - Basic familiarity with shell scripting
 
+> **macOS users**: Run the week-00 lab container which has all required tools pre-installed:
+> ```bash
+> cd weeks/week-00-linux-containers-and-cloud-networking
+> ./lab-start.sh --build   # first time
+> ./lab-start.sh           # subsequent runs
+> ```
+> Inside the container, lab scripts are at `/labs/01/`.
+
 The exercises are designed to run sequentially but each section is independent. Estimated time: 60-90 minutes.
 
 ---

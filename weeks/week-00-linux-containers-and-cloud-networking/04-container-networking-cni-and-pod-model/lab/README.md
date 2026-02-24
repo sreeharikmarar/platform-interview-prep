@@ -9,6 +9,14 @@ This lab manually recreates what a CNI plugin does when it wires a pod into the 
 - No Kubernetes cluster required — this lab runs entirely on Linux network primitives
 - Optional: the helper script `lab/veth-bridge-demo.sh` automates all steps and can serve as a reference
 
+> **macOS users**: Run the week-00 lab container which provides a privileged Linux environment with `ip`, `iptables`, `conntrack`, and all networking tools:
+> ```bash
+> cd weeks/week-00-linux-containers-and-cloud-networking
+> ./lab-start.sh --build   # first time
+> ./lab-start.sh           # subsequent runs
+> ```
+> Inside the container, lab scripts are at `/labs/04/`. You are already root — no `sudo` needed.
+
 ## Learning Objectives
 
 After completing this lab you will be able to:
