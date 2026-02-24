@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Docker CLI (no daemon — talks to host Docker via socket mount)
     docker.io \
     # General utilities
+    ca-certificates \
     python3 \
     jq \
     curl \
