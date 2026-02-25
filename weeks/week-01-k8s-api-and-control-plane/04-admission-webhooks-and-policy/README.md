@@ -411,36 +411,32 @@ kubectl delete validatingadmissionpolicybinding require-labels-binding
 ## Lightweight Lab
 
 ```bash
-# 1. Apply a ValidatingAdmissionPolicy (requires K8s 1.26+)
+# 1. Apply a ValidatingAdmissionPolicy + binding (requires K8s 1.26+)
 kubectl apply -f lab/validating-policy.yaml
-# Observe: Creates a policy requiring 'team' label on Deployments
+# Observe: Creates policy requiring 'owner' label on Deployments, plus its binding
 
-# 2. Create the policy binding
-kubectl apply -f lab/policy-binding.yaml
-# Observe: Binds the policy to production namespace
-
-# 3. Try to create a Deployment without required label (should fail)
+# 2. Try to create a Deployment without required label (should fail)
 kubectl apply -f lab/bad-deploy.yaml
-# Observe: Rejected with message "Deployment must have 'team' label"
+# Observe: Rejected with message "deployment must have metadata.labels.owner"
 
-# 4. Create a Deployment with required label (should succeed)
+# 3. Create a Deployment with required label (should succeed)
 kubectl apply -f lab/good-deploy.yaml
 # Observe: Accepted and created
 
-# 5. Check policy status
+# 4. Check policy status
 kubectl get validatingadmissionpolicy -o yaml
 # Observe: Conditions showing if policy is active
 
-# 6. Test policy in dry-run mode
+# 5. Test policy in dry-run mode
 kubectl apply --dry-run=server -f lab/bad-deploy.yaml
 # Observe: Still rejected (policies run in dry-run)
 
-# 7. Temporarily disable policy
-kubectl delete validatingadmissionpolicybinding require-labels-binding
+# 6. Temporarily disable policy
+kubectl delete validatingadmissionpolicybinding require-owner-label-binding
 kubectl apply -f lab/bad-deploy.yaml
 # Observe: Now succeeds (policy not bound)
 
-# 8. Cleanup
+# 7. Cleanup
 kubectl delete -f lab/good-deploy.yaml
 kubectl delete -f lab/validating-policy.yaml
 ```

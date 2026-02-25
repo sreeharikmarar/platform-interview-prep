@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: topology-spread
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: topology-spread
+  template:
+    metadata:
+      labels:
+        app: topology-spread
+    spec:
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app: topology-spread
+      containers:
+      - name: pause
+        image: registry.k8s.io/pause:3.9

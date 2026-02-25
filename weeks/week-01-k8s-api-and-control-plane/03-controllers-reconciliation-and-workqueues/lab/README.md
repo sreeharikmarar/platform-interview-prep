@@ -23,7 +23,7 @@ kubectl apply -f lab/parent-cm.yaml
 kubectl get cm parent -o yaml
 ```
 
-Expected: ConfigMap with some data fields (e.g., `template: "Hello from parent"`).
+Expected: ConfigMap with data field `message: "hello-from-parent"`.
 
 ---
 
@@ -92,9 +92,9 @@ kubectl get cm child -o yaml
 ```
 
 **What's happening**: The controller created a child ConfigMap with:
-- Data derived from the parent (e.g., transforming template)
+- Data derived from the parent's `message` field
 - Owner reference pointing to the parent
-- Labels indicating it was created by the controller
+- `controller: true` and `blockOwnerDeletion: true` on the owner reference
 
 **Observe**:
 ```yaml
@@ -107,7 +107,7 @@ metadata:
     controller: true
     blockOwnerDeletion: true
 data:
-  derived: "Processed: Hello from parent"
+  derived: "Processed: hello-from-parent"
 ```
 
 ---
@@ -160,7 +160,7 @@ Reconciliation complete
 
 ```bash
 # Update parent data
-kubectl patch cm parent --type=merge -p '{"data":{"template":"Updated value"}}'
+kubectl patch cm parent --type=merge -p '{"data":{"message":"Updated value"}}'
 
 # Re-run reconciler
 kubectl delete job cm-reconciler

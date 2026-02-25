@@ -339,9 +339,9 @@ kubectl get deploy ssa-demo -o jsonpath='{.spec.template.spec.containers[*].name
 
 # 9. Rollback and demonstrate Strategic Merge Patch
 kubectl apply -f lab/deploy.yaml  # Reset
-kubectl patch deploy ssa-demo --type=strategic -p '{"spec":{"template":{"spec":{"containers":[{"name":"nginx","image":"nginx:1.25"}]}}}}'
+kubectl patch deploy ssa-demo --type=strategic -p '{"spec":{"template":{"spec":{"containers":[{"name":"app","image":"nginx:1.25"}]}}}}'
 kubectl get deploy ssa-demo -o jsonpath='{.spec.template.spec.containers[*].name} {.spec.template.spec.containers[0].image}'
-# Observe: nginx container updated IN PLACE using name as merge key
+# Observe: app container updated IN PLACE using name as merge key
 
 # 10. Demonstrate JSON Patch for precise operations
 kubectl patch deploy ssa-demo --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/env","value":[{"name":"DEBUG","value":"true"}]}]'

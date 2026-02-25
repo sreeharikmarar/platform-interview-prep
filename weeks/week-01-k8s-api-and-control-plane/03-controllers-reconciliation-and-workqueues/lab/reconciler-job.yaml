@@ -13,6 +13,46 @@ spec:
         args:
         - |
           set -e
+          echo "Starting reconciler..."
+
+          # 1. Fetch parent state
           MSG=$(kubectl get cm parent -o jsonpath='{.data.message}')
-          kubectl create cm child --from-literal=message="$MSG" --dry-run=client -o yaml | kubectl apply -f -
-          echo "reconciled child.message=$MSG"
+          PARENT_UID=$(kubectl get cm parent -o jsonpath='{.metadata.uid}')
+          echo "Found parent ConfigMap: parent"
+
+          # 2. Compute desired child state
+          echo "Computing desired child state..."
+          DESIRED="Processed: $MSG"
+
+          # 3. Check if child exists
+          if kubectl get cm child > /dev/null 2>&1; then
+            CURRENT=$(kubectl get cm child -o jsonpath='{.data.derived}')
+            if [ "$CURRENT" = "$DESIRED" ]; then
+              echo "Child ConfigMap exists and matches desired state, no action needed"
+            else
+              echo "Child ConfigMap exists but differs from desired state"
+              echo "Updating child ConfigMap..."
+              kubectl patch cm child --type=merge -p "{\"data\":{\"derived\":\"$DESIRED\"}}"
+              echo "Child ConfigMap updated successfully"
+            fi
+          else
+            echo "Child ConfigMap does not exist, creating..."
+            cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: child
+            ownerReferences:
+            - apiVersion: v1
+              kind: ConfigMap
+              name: parent
+              uid: "$PARENT_UID"
+              controller: true
+              blockOwnerDeletion: true
+          data:
+            derived: "$DESIRED"
+          EOF
+            echo "Child ConfigMap created successfully"
+          fi
+
+          echo "Reconciliation complete"

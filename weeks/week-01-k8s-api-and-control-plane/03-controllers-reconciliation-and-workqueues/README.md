@@ -17,7 +17,7 @@ The reconcile function must be idempotent and side-effect-free in terms of Kuber
 
 ## Key Concepts
 
-- **Informer**: Client-side component that watches a resource type, maintains a local cache (Store/Indexer), and invokes event handlers (AddFunc/UpdateFunc/DeleteFunc)
+- **Informer**: Client-side component that watches a resource type, maintains a local cache (Store/Indexer), and invokes event handlers (OnAdd/OnUpdate/OnDelete)
 - **Reflector**: Component inside Informer that manages the watch stream, handles reconnection, and performs periodic relist to resync cache
 - **SharedInformerFactory**: Factory that creates Informers and ensures multiple controllers watching the same resource share one watch connection
 - **Lister**: Read-only interface to the Informer cache, used in reconcile to fetch objects without hitting the API server

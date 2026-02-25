@@ -16,153 +16,94 @@ This lab demonstrates in-cluster policy enforcement using ValidatingAdmissionPol
 kubectl apply -f lab/validating-policy.yaml
 ```
 
-**What's happening**: This creates a policy with CEL expressions that validate Deployment resources. The policy checks:
-- Deployment must have a `team` label
-- Replica count must not exceed 10
-- Container images must not use `latest` tag
+**What's happening**: This creates a ValidatingAdmissionPolicy and its binding in one file. The policy checks that Deployments have an `owner` label. The binding activates the policy with `validationActions: [Deny]`.
 
 **Verification**:
 ```bash
 kubectl get validatingadmissionpolicy
-kubectl get validatingadmissionpolicy require-labels -o yaml
-```
+kubectl get validatingadmissionpolicy require-owner-label -o yaml
 
-Expected: Policy is created with status showing it's been compiled successfully.
-
----
-
-### 2. Create a policy binding
-
-```bash
-kubectl apply -f lab/policy-binding.yaml
-```
-
-**What's happening**: The binding activates the policy for specific resources. It specifies:
-- Which policy to use (policyName: require-labels)
-- Which namespaces it applies to (via namespaceSelector)
-- What action to take on violation (validationActions: [Deny])
-
-Without a binding, policies are inactive.
-
-**Verification**:
-```bash
+# Check the binding was also created
 kubectl get validatingadmissionpolicybinding
-kubectl describe validatingadmissionpolicybinding require-labels-binding
+kubectl describe validatingadmissionpolicybinding require-owner-label-binding
 ```
+
+Expected: Policy and binding are created. Policy status shows it's been compiled successfully.
 
 ---
 
-### 3. Try to create a Deployment without required label
+### 2. Try to create a Deployment without required label
 
 ```bash
 kubectl apply -f lab/bad-deploy.yaml
 ```
 
-**What's happening**: This Deployment manifest is missing the `team` label. The admission policy's CEL expression `has(object.metadata.labels.team)` evaluates to false, causing denial.
+**What's happening**: The `no-owner` Deployment has no `owner` label. The CEL expression `has(object.metadata.labels) && has(object.metadata.labels.owner)` evaluates to false, causing denial.
 
 **Expected output**:
 ```
-Error from server (Forbidden): admission webhook "validating.admission.policy.k8s.io" denied the request: ValidatingAdmissionPolicy 'require-labels' with binding 'require-labels-binding' denied request: Deployment must have 'team' label
+Error from server (Forbidden): ... ValidatingAdmissionPolicy 'require-owner-label' with binding 'require-owner-label-binding' denied request: deployment must have metadata.labels.owner
 ```
 
 **Observe**: The request was rejected at admission time, before persisting to etcd.
 
 ---
 
-### 4. Create a Deployment with required label
+### 3. Create a Deployment with required label
 
 ```bash
 kubectl apply -f lab/good-deploy.yaml
 ```
 
-**What's happening**: This manifest includes `team: platform` label and uses a tagged image (not `latest`). All CEL validations pass.
+**What's happening**: The `with-owner` Deployment has `owner: platform` label. The CEL validation passes.
 
 **Expected**: Deployment created successfully.
 
 **Verification**:
 ```bash
-kubectl get deploy good-deploy -o jsonpath='{.metadata.labels.team}'
+kubectl get deploy with-owner -o jsonpath='{.metadata.labels.owner}'
 # Should output: platform
 
-kubectl get deploy good-deploy -o jsonpath='{.spec.template.spec.containers[0].image}'
-# Should output: nginx:1.25 (not latest)
+kubectl get deploy with-owner -o jsonpath='{.spec.template.spec.containers[0].image}'
+# Should output: nginx:1.27
 ```
 
 ---
 
-### 5. Test replica count validation
+### 4. Verify the CEL expression's defensive null check
 
 ```bash
-# Try to create a Deployment with 15 replicas (exceeds limit of 10)
+# Create a Deployment with NO labels at all (not even an empty map)
 kubectl apply -f - <<EOF
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: too-many-replicas
-  labels:
-    team: platform
+  name: no-labels-at-all
 spec:
-  replicas: 15
+  replicas: 1
   selector:
     matchLabels:
-      app: nginx
+      app: test
   template:
     metadata:
       labels:
-        app: nginx
+        app: test
     spec:
       containers:
-      - name: nginx
-        image: nginx:1.25
+      - name: app
+        image: nginx:1.27
 EOF
 ```
 
-**Expected output**:
-```
-Error: ... denied request: Deployments cannot exceed 10 replicas
-```
+**What's happening**: The CEL expression uses `has(object.metadata.labels) && has(object.metadata.labels.owner)`. The first check prevents a null-pointer error when labels are absent entirely. Without it, `has(object.metadata.labels.owner)` would fail on a nil map.
 
-**Observe**: The CEL expression `object.spec.replicas <= 10` evaluated to false.
+**Expected**: Rejected — no `owner` label.
 
----
-
-### 6. Test image tag validation
-
-```bash
-# Try to use 'latest' tag
-kubectl apply -f - <<EOF
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: latest-tag
-  labels:
-    team: platform
-spec:
-  replicas: 3
-  selector:
-    matchLabels:
-      app: nginx
-  template:
-    metadata:
-      labels:
-        app: nginx
-    spec:
-      containers:
-      - name: nginx
-        image: nginx:latest
-EOF
-```
-
-**Expected output**:
-```
-Error: ... denied request: Container images must not use 'latest' tag
-```
-
-**Observe**: CEL expression validates image tags across all containers.
+**Observe**: The defensive `has()` chain is a CEL best practice for nested field access.
 
 ---
 
-### 7. Test with dry-run
+### 5. Test with dry-run
 
 ```bash
 # Policies still run in dry-run mode
@@ -175,11 +116,11 @@ This is important for CI/CD validation - you can test manifests without actually
 
 ---
 
-### 8. Check policy status and metrics
+### 6. Check policy status and metrics
 
 ```bash
 # View policy conditions
-kubectl get validatingadmissionpolicy require-labels -o jsonpath='{.status.conditions}'
+kubectl get validatingadmissionpolicy require-owner-label -o jsonpath='{.status.conditions}'
 
 # If API server exposes metrics (requires access to API server metrics endpoint)
 # kubectl port-forward -n kube-system pod/kube-apiserver-control-plane 6443:6443
@@ -190,7 +131,7 @@ kubectl get validatingadmissionpolicy require-labels -o jsonpath='{.status.condi
 
 ---
 
-### 9. Scope policy to specific namespaces
+### 7. Scope policy to specific namespaces
 
 ```bash
 # Create a namespace without the policy
@@ -198,7 +139,7 @@ kubectl create namespace dev
 kubectl label namespace dev environment=development
 
 # Update binding to only apply to prod namespace
-kubectl patch validatingadmissionpolicybinding require-labels-binding --type=merge -p '
+kubectl patch validatingadmissionpolicybinding require-owner-label-binding --type=merge -p '
 {
   "spec": {
     "matchResources": {
@@ -226,11 +167,11 @@ kubectl apply -f lab/bad-deploy.yaml -n prod
 
 ---
 
-### 10. Temporarily disable policy
+### 8. Temporarily disable policy
 
 ```bash
 # Delete the binding (policy still exists but is inactive)
-kubectl delete validatingadmissionpolicybinding require-labels-binding
+kubectl delete validatingadmissionpolicybinding require-owner-label-binding
 
 # Now bad deploys are allowed
 kubectl apply -f lab/bad-deploy.yaml -n prod
@@ -240,7 +181,7 @@ kubectl apply -f lab/bad-deploy.yaml -n prod
 
 **Restore**:
 ```bash
-kubectl apply -f lab/policy-binding.yaml
+kubectl apply -f lab/validating-policy.yaml
 ```
 
 ---
@@ -249,8 +190,7 @@ kubectl apply -f lab/policy-binding.yaml
 
 ```bash
 kubectl delete deploy --all --all-namespaces
-kubectl delete validatingadmissionpolicybinding require-labels-binding
-kubectl delete validatingadmissionpolicy require-labels
+kubectl delete -f lab/validating-policy.yaml
 kubectl delete namespace dev prod
 ```
 

@@ -99,7 +99,7 @@ Expected: Bob owns spec.replicas, alice owns spec.template.spec.containers and o
 ```bash
 # First, check current containers
 kubectl get deploy ssa-demo -o jsonpath='{.spec.template.spec.containers[*].name}'
-# Should show: nginx (and possibly others)
+# Should show: app
 
 # Apply a patch with one container using JSON Merge Patch
 kubectl patch deploy ssa-demo --type=merge -p '{"spec":{"template":{"spec":{"containers":[{"name":"sidecar","image":"busybox:1.36"}]}}}}'
@@ -108,7 +108,7 @@ kubectl patch deploy ssa-demo --type=merge -p '{"spec":{"template":{"spec":{"con
 kubectl get deploy ssa-demo -o jsonpath='{.spec.template.spec.containers[*].name}'
 ```
 
-**What's happening**: JSON Merge Patch treats arrays atomically. The patch replaces the entire containers array with just [sidecar]. Any other containers (nginx, init containers) are deleted.
+**What's happening**: JSON Merge Patch treats arrays atomically. The patch replaces the entire containers array with just [sidecar]. Any other containers (app, init containers) are deleted.
 
 **Observe**: Only "sidecar" container remains. Original containers are gone!
 
@@ -125,16 +125,16 @@ kubectl apply -f lab/deploy.yaml
 # Verify containers
 kubectl get deploy ssa-demo -o jsonpath='{.spec.template.spec.containers[*].name}'
 
-# Update nginx container's image using Strategic Merge Patch (default for kubectl patch)
-kubectl patch deploy ssa-demo --type=strategic -p '{"spec":{"template":{"spec":{"containers":[{"name":"nginx","image":"nginx:1.25"}]}}}}'
+# Update app container's image using Strategic Merge Patch (default for kubectl patch)
+kubectl patch deploy ssa-demo --type=strategic -p '{"spec":{"template":{"spec":{"containers":[{"name":"app","image":"nginx:1.25"}]}}}}'
 
 # Check result
 kubectl get deploy ssa-demo -o jsonpath='{.spec.template.spec.containers[*].name} {.spec.template.spec.containers[0].image}'
 ```
 
-**What's happening**: Strategic Merge Patch uses patchMergeKey (name) to identify which container to update. It merges the nginx container's fields without touching other containers.
+**What's happening**: Strategic Merge Patch uses patchMergeKey (name) to identify which container to update. It merges the app container's fields without touching other containers.
 
-**Observe**: nginx container's image updated to 1.25, container list otherwise unchanged.
+**Observe**: app container's image updated to 1.25, container list otherwise unchanged.
 
 ---
 
@@ -243,7 +243,7 @@ done
 # Terminal 2: Manual change (simulating cluster admin)
 kubectl scale deploy ssa-demo --replicas=10
 
-# Observe: Next gitops apply detects drift and resets replicas to 3
+# Observe: Next gitops apply detects drift and resets replicas to 1
 ```
 
 ---
