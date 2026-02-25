@@ -262,10 +262,10 @@ If you're using kubebuilder markers (the `+kubebuilder:` comments), generate CRD
 go install sigs.k8s.io/controller-tools/cmd/controller-gen@latest
 
 # Generate CRD YAML
-controller-gen crd paths=./api/... output:crd:dir=./config/crd
+controller-gen crd paths=./api/... output:crd:artifacts:config=./config/crd
 
 # Generate RBAC YAML (based on markers in controller)
-controller-gen rbac:roleName=controller-role paths=./controllers/... output:rbac:dir=./config/rbac
+controller-gen rbac:roleName=controller-role paths=./controllers/... output:rbac:artifacts:config=./config/rbac
 ```
 
 Alternatively, use the provided YAML files in this directory:

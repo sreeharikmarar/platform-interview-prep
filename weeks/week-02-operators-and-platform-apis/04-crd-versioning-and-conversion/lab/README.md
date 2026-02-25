@@ -480,7 +480,8 @@ Read existing v1alpha1 resources in v1beta1:
 kubectl get gateway web-gateway -n gateway-demo -o yaml
 # Should show apiVersion: networking.example.com/v1alpha1
 
-kubectl get gateway web-gateway -n gateway-demo -o yaml --output-version=networking.example.com/v1beta1
+# Request the object at the v1beta1 version (triggers conversion)
+kubectl get gateways.v1beta1.networking.example.com web-gateway -n gateway-demo -o yaml
 # Should show apiVersion: networking.example.com/v1beta1 with listeners array
 ```
 
@@ -505,7 +506,7 @@ EOF
 Read it in v1alpha1:
 
 ```bash
-kubectl get gateway multi-gateway -n gateway-demo -o yaml --output-version=networking.example.com/v1alpha1
+kubectl get gateways.v1alpha1.networking.example.com multi-gateway -n gateway-demo -o yaml
 ```
 
 You should see:
@@ -558,7 +559,7 @@ spec:
 EOF
 
 # Read in v1alpha1 (triggers v1beta1 → v1alpha1 conversion)
-kubectl get gateway roundtrip-test -n gateway-demo -o yaml --output-version=networking.example.com/v1alpha1
+kubectl get gateways.v1alpha1.networking.example.com roundtrip-test -n gateway-demo -o yaml
 
 # Update status in v1alpha1 (triggers v1alpha1 → v1beta1 conversion on write)
 kubectl patch gateway roundtrip-test -n gateway-demo --subresource=status --type=merge -p '{"status":{"ready":true}}'
@@ -580,7 +581,7 @@ kubectl scale deployment gateway-conversion-webhook -n gateway-system --replicas
 Try to read a gateway in a different version:
 
 ```bash
-kubectl get gateway web-gateway -n gateway-demo -o yaml --output-version=networking.example.com/v1beta1
+kubectl get gateways.v1beta1.networking.example.com web-gateway -n gateway-demo -o yaml
 ```
 
 You should get an error like "conversion webhook failed: connection refused."

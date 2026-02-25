@@ -312,16 +312,16 @@ kubectl get virtualservice -A -o json | \
 kubectl exec -n kube-system etcd-hub-control-plane -- \
   etcdctl --endpoints=https://127.0.0.1:2379 \
   --cacert=/etc/kubernetes/pki/etcd/ca.crt \
-  --cert=/etc/kubernetes/pki/etcd/peer.crt \
-  --key=/etc/kubernetes/pki/etcd/peer.key \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
   endpoint status --write-out=table
 
 # Count objects by type in etcd directly
 kubectl exec -n kube-system etcd-hub-control-plane -- \
   etcdctl --endpoints=https://127.0.0.1:2379 \
   --cacert=/etc/kubernetes/pki/etcd/ca.crt \
-  --cert=/etc/kubernetes/pki/etcd/peer.crt \
-  --key=/etc/kubernetes/pki/etcd/peer.key \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
   get /registry/virtualservices --prefix --keys-only | wc -l
 
 # Check StorageVersionMigration status for in-progress CRD migrations
@@ -418,7 +418,7 @@ kubectl get nodes -l gpu-class=nvidia-a100-40gb \
 
 # Check ResourceQuota usage vs hard limits in GPU namespaces
 kubectl get resourcequota -A -o json | \
-  jq '.items[] | select(.spec.hard["requests.nvidia/gpu"] != null) | {ns: .metadata.namespace, hard: .spec.hard, used: .status.used}'
+  jq '.items[] | select(.spec.hard["requests.nvidia.com/gpu"] != null) | {ns: .metadata.namespace, hard: .spec.hard, used: .status.used}'
 
 # Check InferenceQuota status
 kubectl get inferencequota -n team-ai -o yaml

@@ -400,11 +400,10 @@ kind create cluster --name agent-lab
 kubectl apply -f lab/sample-ingress.yaml
 kubectl get ingress -A
 
-# Run the discovery script (simulates agent observe phase)
-bash lab/discover-ingresses.sh | jq .
+# Discovery phase (see lab/README.md for the full jq pipeline)
+kubectl get ingress -o json | jq '[.items[] | {name: .metadata.name, namespace: .metadata.namespace, rules: .spec.rules}]'
 
-# Run the translation script (simulates agent plan phase)
-bash lab/translate-to-httproutes.sh | kubectl apply --dry-run=server -f -
+# Follow the step-by-step lab for translation, dry-run, and migration
 ```
 
 ---

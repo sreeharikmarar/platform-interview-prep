@@ -2,14 +2,21 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: drift-demo
+  namespace: default
 spec:
-  replicas: 1
+  replicas: 3
   selector:
-    matchLabels: {app: drift-demo}
+    matchLabels:
+      app: drift-demo
   template:
     metadata:
-      labels: {app: drift-demo}
+      labels:
+        app: drift-demo
     spec:
       containers:
-      - name: app
-        image: nginx:1.27
+      - name: nginx
+        image: nginx:1.25
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi

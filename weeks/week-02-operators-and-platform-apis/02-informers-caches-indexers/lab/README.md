@@ -171,6 +171,7 @@ import (
 
     corev1 "k8s.io/api/core/v1"
     metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+    "k8s.io/apimachinery/pkg/labels"
     "k8s.io/client-go/informers"
     "k8s.io/client-go/kubernetes"
     "k8s.io/client-go/tools/cache"
@@ -260,7 +261,7 @@ func main() {
 
     // Compare with O(n) list-and-filter approach
     start := time.Now()
-    allPods, err := podInformer.Lister().List(metav1.LabelSelector{}.AsSelector())
+    allPods, err := podInformer.Lister().List(labels.Everything())
     if err != nil {
         panic(err)
     }
@@ -313,7 +314,7 @@ import (
     "fmt"
     "time"
 
-    corev1 "k8s.io/api/core/v1"
+    "k8s.io/apimachinery/pkg/labels"
     "k8s.io/client-go/informers"
     "k8s.io/client-go/kubernetes"
     "k8s.io/client-go/tools/cache"
@@ -333,7 +334,6 @@ func main() {
     informerFactory := informers.NewSharedInformerFactory(clientset, 0) // No resync
     podInformer := informerFactory.Core().V1().Pods()
 
-    listCount := 0
     addCount := 0
 
     podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{

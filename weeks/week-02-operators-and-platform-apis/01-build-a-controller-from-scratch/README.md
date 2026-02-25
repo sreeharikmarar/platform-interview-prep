@@ -342,7 +342,7 @@ func (r *DatabaseReconciler) SetupWithManager(mgr ctrl.Manager) error {
         For(&v1alpha1.Database{}).                    // Primary resource to watch
         Owns(&corev1.Secret{}).                       // Watch Secrets owned by Database
         Watches(
-            &source.Kind{Type: &corev1.ConfigMap{}},  // Watch ConfigMaps
+            &corev1.ConfigMap{},                      // Watch ConfigMaps
             handler.EnqueueRequestsFromMapFunc(r.findDatabasesForConfigMap),
         ).
         WithOptions(controller.Options{

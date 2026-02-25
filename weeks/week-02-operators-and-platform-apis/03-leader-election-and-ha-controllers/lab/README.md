@@ -106,7 +106,7 @@ func runController(ctx context.Context, identity string) {
 		case <-ctx.Done():
 			klog.Info("Context canceled, stopping controller")
 			return
-		case <-ticker.Tick:
+		case <-ticker.C:
 			klog.Infof("✅ Leader %s is reconciling... (timestamp: %s)", identity, time.Now().Format(time.RFC3339))
 		}
 	}

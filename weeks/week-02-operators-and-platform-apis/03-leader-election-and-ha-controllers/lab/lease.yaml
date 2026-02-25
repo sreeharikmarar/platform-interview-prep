@@ -1,7 +1,7 @@
 apiVersion: coordination.k8s.io/v1
 kind: Lease
 metadata:
-  name: controller-leader
+  name: demo-controller-leader
+  namespace: leader-election-demo
 spec:
-  holderIdentity: "none"
   leaseDurationSeconds: 15
