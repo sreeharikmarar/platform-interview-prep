@@ -34,22 +34,22 @@ You should see one control-plane node in Ready state.
 kubectl apply -f lab/crd.yaml
 ```
 
-**What's happening**: The API server validates the CRD schema, persists it to etcd at `/registry/apiextensions.k8s.io/customresourcedefinitions/widgets.example.com`, and the APIExtensions controller starts serving the new `/apis/example.com/v1/widgets` endpoint.
+**What's happening**: The API server validates the CRD schema, persists it to etcd at `/registry/apiextensions.k8s.io/customresourcedefinitions/widgets.demo.io`, and the APIExtensions controller starts serving the new `/apis/demo.io/v1/widgets` endpoint.
 
 **Observe**: The CRD defines the schema for Widget resources.
 
 **Verification**:
 ```bash
 # Check that the CRD is established (ready to accept Widget instances)
-kubectl get crd widgets.example.com -o jsonpath='{.status.conditions[?(@.type=="Established")].status}'
+kubectl get crd widgets.demo.io -o jsonpath='{.status.conditions[?(@.type=="Established")].status}'
 # Should output: True
 
 # See the API group and version
 kubectl api-resources | grep widget
-# Should show: widgets, example.com/v1
+# Should show: widgets, demo.io/v1
 
 # Inspect the full schema
-kubectl get crd widgets.example.com -o yaml | less
+kubectl get crd widgets.demo.io -o yaml | less
 ```
 
 ---
@@ -64,7 +64,7 @@ kubectl apply -f lab/widget.yaml
 1. API server receives the request, authenticates/authorizes
 2. Validates the Widget against the CRD's OpenAPI schema
 3. Runs admission webhooks (none configured for this resource)
-4. Persists to etcd at `/registry/example.com/widgets/default/demo`
+4. Persists to etcd at `/registry/demo.io/widgets/default/demo`
 5. Assigns metadata.uid (unique identifier), resourceVersion (etcd revision), and generation (starts at 1)
 6. Watch cache notifies any controllers watching widgets
 
@@ -234,7 +234,7 @@ kubectl exec -n kube-system etcd-prep-control-plane -- sh -c \
    --cacert=/etc/kubernetes/pki/etcd/ca.crt \
    --cert=/etc/kubernetes/pki/etcd/server.crt \
    --key=/etc/kubernetes/pki/etcd/server.key \
-   get /registry/example.com/widgets/default/demo --print-value-only" | strings | head -20
+   get /registry/demo.io/widgets/default/demo --print-value-only" | strings | head -20
 ```
 
 **Observe**: The raw protobuf-encoded object stored in etcd. You'll see fragments of field names and values.
@@ -245,7 +245,7 @@ kubectl exec -n kube-system etcd-prep-control-plane -- sh -c \
 
 ```bash
 kubectl delete widget demo
-kubectl delete crd widgets.example.com
+kubectl delete crd widgets.demo.io
 
 # Or tear down the entire cluster
 kind delete cluster --name prep
