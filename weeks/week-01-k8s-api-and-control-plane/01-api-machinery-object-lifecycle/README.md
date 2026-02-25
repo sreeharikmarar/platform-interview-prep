@@ -25,6 +25,139 @@ Understanding this architecture explains why Kubernetes is resilient (controller
 - **Informer**: Client-side component that watches a resource type, maintains a local cache (Store), and notifies event handlers
 - **metadata.uid**: Immutable unique identifier for object lifetime; changes if you delete and recreate an object with the same name
 
+## API Resource Structure
+
+Every Kubernetes object has a precise identity within a taxonomy of groups, versions, kinds, and resources. Understanding this taxonomy is essential for writing RBAC rules, building dynamic clients, and reasoning about CRD design.
+
+### GVK and GVR
+
+A resource type is identified in two complementary ways:
+
+- **Group/Version/Kind (GVK)** — the *type* identity used in Go code and manifests. Example: `apps/v1/Deployment`. Kind is the PascalCase Go type name.
+- **Group/Version/Resource (GVR)** — the *HTTP path* identity used in REST calls and RBAC rules. Example: `apps/v1/deployments`. Resource is the lowercase plural form.
+
+The mapping between GVK and GVR is maintained by `runtime.DefaultRESTMapper`. Most of the time the resource is just the lowercased, pluralised kind, but exceptions exist (e.g., `Endpoints` kind maps to `endpoints` resource — already plural).
+
+```
+GVK: apps/v1/Deployment        GVR: apps/v1/deployments
+     ───┬ ─┬ ──────┬                ───┬ ─┬ ──────────┬
+     group ver  kind              group ver   resource
+```
+
+### API Group Organization
+
+| Category | apiVersion format | URL prefix | Examples |
+|----------|------------------|------------|----------|
+| Core (legacy) group `""` | `v1` | `/api/v1/...` | Pod, Service, ConfigMap, Secret, Namespace |
+| Named groups | `<group>/<version>` | `/apis/<group>/<version>/...` | `apps/v1`, `batch/v1`, `networking.k8s.io/v1` |
+
+Key named groups:
+- `apps` — Deployment, StatefulSet, DaemonSet, ReplicaSet
+- `batch` — Job, CronJob
+- `networking.k8s.io` — Ingress, NetworkPolicy
+- `rbac.authorization.k8s.io` — Role, ClusterRole, RoleBinding, ClusterRoleBinding
+- `apiextensions.k8s.io` — CustomResourceDefinition
+
+The core group has no group prefix because it predates the group mechanism — `apiVersion: v1` is shorthand for group `""`, version `v1`.
+
+### Version Semantics
+
+Versions follow a maturity progression: `v1alpha1` → `v1beta1` → `v1`.
+
+Two flags on each version determine how it behaves at the API server:
+
+- **`served: true`** — the API server accepts requests at this version (visible in `kubectl api-versions`)
+- **`storage: true`** — objects are persisted in etcd at this version; exactly one version per resource must be the storage version
+
+When a CRD serves multiple versions (e.g., `v1alpha1` and `v1`), conversion webhooks translate between the served version and the storage version. Objects written at `v1alpha1` are converted to the storage version before persistence and converted back when read at `v1alpha1`. This is visible in the lab CRD (`lab/crd.yaml`), which defines a single version `v1` with both `served: true` and `storage: true`.
+
+### Object Anatomy
+
+Every Kubernetes object is composed of four sections:
+
+```yaml
+apiVersion: apps/v1          # ─┐
+kind: Deployment              # ─┘ TypeMeta
+metadata:                     # ─── ObjectMeta
+  name: nginx
+  namespace: default
+  uid: 8a1b2c3d-...
+  resourceVersion: "1234"
+  generation: 3
+  creationTimestamp: "2025-01-01T00:00:00Z"
+  labels: { ... }
+  annotations: { ... }
+  ownerReferences: [ ... ]
+  finalizers: [ ... ]
+  managedFields: [ ... ]
+spec:                         # ─── Spec (desired state)
+  replicas: 3
+  template: { ... }
+status:                       # ─── Status (observed state)
+  availableReplicas: 3
+  observedGeneration: 3
+  conditions: [ ... ]
+```
+
+| Section | Purpose | Who writes | Notes |
+|---------|---------|-----------|-------|
+| **TypeMeta** | `apiVersion` + `kind` — identifies the type | System | Not persisted in etcd (derived from the storage path) |
+| **ObjectMeta** | Identity, versioning, ownership, field management | System + user (labels, annotations, finalizers) | `resourceVersion` changes on every write; `generation` only on spec change |
+| **Spec** | User's desired state | User / GitOps controller | Writing here increments `metadata.generation` |
+| **Status** | System's observed state | Controllers | Separate `/status` subresource; does **not** increment `generation` |
+
+The spec/status split enforces a clear contract: users declare intent in spec, controllers report reality in status. RBAC can restrict who writes each.
+
+### API Discovery
+
+Clients discover available resources dynamically:
+
+| Endpoint | Returns | CLI equivalent |
+|----------|---------|---------------|
+| `GET /apis` | All API groups and their versions | `kubectl api-versions` |
+| `GET /apis/<group>/<version>` | All resources in that group/version (verbs, namespaced, etc.) | `kubectl api-resources` |
+| `GET /api/v1` | Core group resources | — |
+
+`kubectl api-resources` aggregates discovery docs from all groups to build its table. Discovery is cached client-side (`~/.kube/cache/discovery/`). Aggregated API servers (e.g., metrics-server) register via `APIService` objects, which tell the kube-apiserver to proxy requests for their group/version.
+
+### Subresources
+
+Subresources are nested endpoints beneath a resource's URL that have independent RBAC and semantics:
+
+| Subresource | URL pattern | Purpose |
+|-------------|-------------|---------|
+| `/status` | `…/widgets/demo/status` | Separate RBAC for spec writers vs status writers |
+| `/scale` | `…/deployments/nginx/scale` | Standardized interface for HPA — reads/writes `spec.replicas` |
+| `/log` | `…/pods/nginx/log` | Stream container logs |
+| `/exec` | `…/pods/nginx/exec` | Exec into container (WebSocket upgrade) |
+
+CRDs opt into subresources explicitly:
+```yaml
+subresources:
+  status: {}                    # enables /status endpoint
+  scale:                        # enables /scale endpoint for HPA
+    specReplicasPath: .spec.replicas
+    statusReplicasPath: .status.replicas
+```
+
+Without `subresources.status: {}`, updates to `.status` go through the main endpoint and increment `generation` — defeating the spec/status contract.
+
+### GVK / GVR Reference Table
+
+| Kind | apiVersion (GVK) | Resource (GVR) | URL path (namespaced) |
+|------|------------------|----------------|-----------------------|
+| Pod | `v1` | `pods` | `/api/v1/namespaces/{ns}/pods` |
+| Service | `v1` | `services` | `/api/v1/namespaces/{ns}/services` |
+| ConfigMap | `v1` | `configmaps` | `/api/v1/namespaces/{ns}/configmaps` |
+| Namespace | `v1` | `namespaces` | `/api/v1/namespaces` (cluster-scoped) |
+| Deployment | `apps/v1` | `deployments` | `/apis/apps/v1/namespaces/{ns}/deployments` |
+| StatefulSet | `apps/v1` | `statefulsets` | `/apis/apps/v1/namespaces/{ns}/statefulsets` |
+| Job | `batch/v1` | `jobs` | `/apis/batch/v1/namespaces/{ns}/jobs` |
+| Ingress | `networking.k8s.io/v1` | `ingresses` | `/apis/networking.k8s.io/v1/namespaces/{ns}/ingresses` |
+| ClusterRole | `rbac.authorization.k8s.io/v1` | `clusterroles` | `/apis/rbac.authorization.k8s.io/v1/clusterroles` (cluster-scoped) |
+| CRD | `apiextensions.k8s.io/v1` | `customresourcedefinitions` | `/apis/apiextensions.k8s.io/v1/customresourcedefinitions` (cluster-scoped) |
+| Widget (lab) | `demo.io/v1` | `widgets` | `/apis/demo.io/v1/namespaces/{ns}/widgets` |
+
 ## Internals
 
 ### Request Path (Write)
@@ -261,7 +394,7 @@ kubectl logs -n kube-system deploy/kube-controller-manager | grep "conflict"
 # 2. Apply the CRD (CustomResourceDefinition) for Widget
 # Observe: This creates the schema for a new API resource type
 kubectl apply -f lab/crd.yaml
-kubectl get crd widgets.example.com -o yaml | grep "group:\|version:\|kind:"
+kubectl get crd widgets.demo.io -o yaml | grep "group:\|version:\|kind:"
 
 # 3. Create a Widget instance
 # Observe: The API server validates against the CRD schema, assigns resourceVersion and generation
@@ -311,5 +444,5 @@ kubectl exec -n kube-system etcd-prep-control-plane -- sh -c \
    --cacert=/etc/kubernetes/pki/etcd/ca.crt \
    --cert=/etc/kubernetes/pki/etcd/server.crt \
    --key=/etc/kubernetes/pki/etcd/server.key \
-   get /registry/example.com/widgets/default/demo" | strings
+   get /registry/demo.io/widgets/default/demo" | strings
 ```
