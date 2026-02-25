@@ -417,12 +417,11 @@ kubectl get widget demo -o jsonpath='{.metadata.resourceVersion} {.metadata.gene
 
 # 7. Watch for changes in real-time
 # Observe: Opens a watch stream; any updates will print MODIFIED events
-kubectl get widget demo -w &
-WATCH_PID=$!
-sleep 2
+# Terminal 1: start the watch (leave running)
+kubectl get widget demo -w
+# Terminal 2: make a change and observe MODIFIED event in Terminal 1
 kubectl patch widget demo --type=merge -p '{"spec":{"size":"small"}}'
-sleep 2
-kill $WATCH_PID
+# When done, Ctrl-C the watch in Terminal 1
 
 # 8. Demonstrate optimistic locking (resourceVersion conflict)
 # Observe: The second update fails because resourceVersion has changed
@@ -444,5 +443,5 @@ kubectl exec -n kube-system etcd-prep-control-plane -- sh -c \
    --cacert=/etc/kubernetes/pki/etcd/ca.crt \
    --cert=/etc/kubernetes/pki/etcd/server.crt \
    --key=/etc/kubernetes/pki/etcd/server.key \
-   get /registry/demo.io/widgets/default/demo" | strings
+   get /registry/demo.io/widgets/default/demo"
 ```

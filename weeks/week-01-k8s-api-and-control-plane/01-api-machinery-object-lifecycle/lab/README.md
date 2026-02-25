@@ -152,27 +152,23 @@ Expected: resourceVersion incremented, generation still 2, observedGeneration is
 
 ### 6. Demonstrate watch streams
 
+Run these in **two separate terminals**:
+
+**Terminal 1** — start the watch:
 ```bash
-# Open a watch in the background
-kubectl get widget demo -w &
-WATCH_PID=$!
-
-# Wait for watch to establish
-sleep 2
-
-# Make a change
-kubectl patch widget demo --type=merge -p '{"spec":{"size":"small"}}'
-
-# Wait to see the MODIFIED event
-sleep 2
-
-# Stop the watch
-kill $WATCH_PID
+kubectl get widget demo -w
 ```
+
+**Terminal 2** — make a change:
+```bash
+kubectl patch widget demo --type=merge -p '{"spec":{"size":"small"}}'
+```
+
+When done, press **Ctrl-C** in Terminal 1 to stop the watch.
 
 **What's happening**: `kubectl get -w` opens a long-lived HTTP connection with `?watch=1`. The API server streams JSON events (ADDED/MODIFIED/DELETED) as they occur. This is the same mechanism Informers use.
 
-**Observe**: You should see a MODIFIED event printed when the patch is applied.
+**Observe**: Terminal 1 prints a MODIFIED line when the patch is applied in Terminal 2.
 
 ---
 
