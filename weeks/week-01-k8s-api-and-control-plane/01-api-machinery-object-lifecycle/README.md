@@ -306,7 +306,7 @@ kubectl run curl --rm -it --image=curlimages/curl -- curl -k https://webhook-svc
 **Mitigation**:
 - Use local SSD or provisioned IOPS volumes for etcd
 - Keep etcd DB size <8GB (set `--quota-backend-bytes=8589934592`)
-- Run defrag regularly: `etcdctl defrag --cluster`
+- Run defrag regularly: `etcdctl defrag --cluster` (compaction is handled automatically by the API server via `--etcd-compaction-interval`; defrag reclaims disk space after compaction)
 - Reduce object churn (short-lived pods, high-frequency status updates)
 - Use status subresources to avoid updating entire objects
 - Monitor `etcd_disk_backend_commit_duration_seconds` (should be <25ms p99)
