@@ -10,7 +10,7 @@ This repo is a 5-week study plan that builds that depth systematically, starting
 
 ## What's inside
 
-Each of the 25 topics follows a consistent format:
+Each of the 24 topics follows a consistent format:
 
 | File | Purpose |
 |------|---------|
@@ -26,7 +26,7 @@ Each of the 25 topics follows a consistent format:
 | **01** | Kubernetes API & Control Plane | API machinery & object lifecycle, SSA & patch semantics, controllers & reconciliation, admission webhooks & policy, scheduler internals |
 | **02** | Operators & Platform APIs | Build a controller from scratch, informers/caches/indexers, leader election & HA, CRD versioning & conversion, GitOps vs controller reconciliation |
 | **03** | Service Mesh, Envoy & Gateways | Envoy architecture & core primitives, traffic management internals, Gateway API vs Istio vs platform abstractions, multi-cluster routing, identity propagation & isolation |
-| **04** | Distributed Systems & Scale | Control plane scale (etcd/apiserver), backpressure & rate limiting, inference gateways & routing, agentic workflows & control loops, capstone platform design |
+| **04** | Distributed Systems & Scale | Control plane scale (etcd/apiserver), backpressure & rate limiting, inference gateways & routing, agentic workflows & control loops |
 
 ## How to use this repo
 
