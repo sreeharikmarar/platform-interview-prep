@@ -382,7 +382,7 @@ spec:
       # Shorter intervals mean faster ejection but more health check overhead.
       interval: 5s
       # Eject an endpoint after 5 consecutive 5xx responses or gateway failures.
-      # "consecutive_gateway_errors" (connection refused, reset) counts separately.
+      # "consecutive_gateway_failure" (502, 503, 504) counts separately.
       consecutive5xxErrors: 5
       consecutiveGatewayErrors: 3
       # After ejection, the endpoint is held out for `baseEjectionTime`.

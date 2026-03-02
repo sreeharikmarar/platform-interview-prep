@@ -225,7 +225,7 @@ spec:
       interval: 30s
 
       # How long an ejected endpoint stays ejected before being re-admitted.
-      # Actual ejection time = baseEjectionTime * ejection count (exponential backoff).
+      # Actual ejection time = baseEjectionTime * ejection count (linear backoff).
       # Envoy: outlier_detection.base_ejection_time
       baseEjectionTime: 30s
 

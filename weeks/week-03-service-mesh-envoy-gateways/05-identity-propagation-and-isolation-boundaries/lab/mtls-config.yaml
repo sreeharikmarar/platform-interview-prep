@@ -21,7 +21,7 @@
 #   4. Istiod signs an X.509 cert with the SPIFFE URI in the SAN field
 #   5. Cert + private key delivered in SDS DiscoveryResponse
 #   6. Envoy loads into DownstreamTlsContext (inbound) + UpstreamTlsContext (outbound)
-#   7. At ~80% of TTL (default ~20h), istiod pushes a new SDS response
+#   7. At ~50% of TTL (default ~12h), istiod pushes a new SDS response
 #   8. Envoy hot-swaps; existing TLS sessions are not disrupted
 # =============================================================================
 
