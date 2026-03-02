@@ -1,6 +1,7 @@
 # Claude Code — user-specific files (exclude)
 .claude/agent-memory/
 .claude/projects/
+.claude/skills/
 .claude/*.jsonl
 .claude/settings.local.json
 

@@ -65,8 +65,8 @@ status:
 mkdir -p configmap-replicator
 cd configmap-replicator
 
-# Initialize Go module
-go mod init github.com/yourusername/configmap-replicator
+# Initialize Go module — replace with your own module path
+go mod init configmap-replicator
 ```
 
 ### Step 2: Install Dependencies
@@ -84,7 +84,6 @@ go get k8s.io/client-go@v0.29.0
 mkdir -p api/v1alpha1
 mkdir -p controllers
 mkdir -p config/crd
-mkdir -p config/rbac
 mkdir -p config/samples
 ```
 
@@ -168,116 +167,277 @@ func init() {
 }
 ```
 
-See `api/v1alpha1/configmapreplicator_types.go` in this directory for the complete implementation.
+Create the scheme registration in `api/v1alpha1/groupversion_info.go`:
+
+```go
+// Package v1alpha1 contains API types for the platform.example.com group.
+//
+// +kubebuilder:object:generate=true
+// +groupName=platform.example.com
+package v1alpha1
+
+import (
+    "k8s.io/apimachinery/pkg/runtime/schema"
+    "sigs.k8s.io/controller-runtime/pkg/scheme"
+)
+
+var (
+    GroupVersion  = schema.GroupVersion{Group: "platform.example.com", Version: "v1alpha1"}
+    SchemeBuilder = &scheme.Builder{GroupVersion: GroupVersion}
+    AddToScheme   = SchemeBuilder.AddToScheme
+)
+```
+
+The `+groupName` marker is required — `controller-gen` uses it to determine the API group when generating the CRD. Without it, the generated CRD will have an empty group and fail validation.
 
 ## Part 3: Implement the Controller
 
-Create the controller in `controllers/configmapreplicator_controller.go`. The controller implements these key patterns:
-
-### Pattern 1: Finalizer Handling
+Create the controller in `controllers/configmapreplicator_controller.go`:
 
 ```go
+package controllers
+
+import (
+    "context"
+    "fmt"
+    "strings"
+    "time"
+
+    corev1 "k8s.io/api/core/v1"
+    apierrors "k8s.io/apimachinery/pkg/api/errors"
+    "k8s.io/apimachinery/pkg/api/meta"
+    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+    "k8s.io/apimachinery/pkg/runtime"
+    ctrl "sigs.k8s.io/controller-runtime"
+    "sigs.k8s.io/controller-runtime/pkg/client"
+    "sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+    "sigs.k8s.io/controller-runtime/pkg/log"
+
+    platformv1alpha1 "configmap-replicator/api/v1alpha1"
+)
+
 const configMapReplicatorFinalizer = "platform.example.com/finalizer"
 
-// Handle deletion - remove replicated ConfigMaps
-if !replicator.DeletionTimestamp.IsZero() {
-    if controllerutil.ContainsFinalizer(replicator, configMapReplicatorFinalizer) {
-        // Delete replicated ConfigMaps from all target namespaces
-        if err := r.deleteReplicatedConfigMaps(ctx, replicator); err != nil {
-            return ctrl.Result{}, err
-        }
+// ConfigMapReplicatorReconciler reconciles ConfigMapReplicator objects by replicating
+// a source ConfigMap to a set of target namespaces.
+type ConfigMapReplicatorReconciler struct {
+    client.Client
+    Scheme *runtime.Scheme
+}
 
-        // Remove finalizer
-        controllerutil.RemoveFinalizer(replicator, configMapReplicatorFinalizer)
+// Reconcile ensures the source ConfigMap is replicated to all target namespaces
+// declared in the ConfigMapReplicator spec.
+func (r *ConfigMapReplicatorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    log := log.FromContext(ctx)
+
+    // Fetch the ConfigMapReplicator
+    replicator := &platformv1alpha1.ConfigMapReplicator{}
+    if err := r.Get(ctx, req.NamespacedName, replicator); err != nil {
+        return ctrl.Result{}, client.IgnoreNotFound(err)
+    }
+
+    // --- Pattern 1: Finalizer Handling ---
+    if !replicator.DeletionTimestamp.IsZero() {
+        if controllerutil.ContainsFinalizer(replicator, configMapReplicatorFinalizer) {
+            if err := r.deleteReplicatedConfigMaps(ctx, replicator); err != nil {
+                return ctrl.Result{}, fmt.Errorf("delete replicated configmaps: %w", err)
+            }
+            controllerutil.RemoveFinalizer(replicator, configMapReplicatorFinalizer)
+            if err := r.Update(ctx, replicator); err != nil {
+                return ctrl.Result{}, fmt.Errorf("remove finalizer: %w", err)
+            }
+        }
+        return ctrl.Result{}, nil
+    }
+
+    // Add finalizer if missing
+    if !controllerutil.ContainsFinalizer(replicator, configMapReplicatorFinalizer) {
+        controllerutil.AddFinalizer(replicator, configMapReplicatorFinalizer)
         if err := r.Update(ctx, replicator); err != nil {
-            return ctrl.Result{}, err
+            return ctrl.Result{}, fmt.Errorf("add finalizer: %w", err)
         }
     }
+
+    // --- Pattern 2: Idempotent Reconciliation ---
+    sourceConfigMap := &corev1.ConfigMap{}
+    err := r.Get(ctx, client.ObjectKey{
+        Name:      replicator.Spec.SourceConfigMap.Name,
+        Namespace: replicator.Spec.SourceConfigMap.Namespace,
+    }, sourceConfigMap)
+    if err != nil {
+        if apierrors.IsNotFound(err) {
+            meta.SetStatusCondition(&replicator.Status.Conditions, metav1.Condition{
+                Type:    "Ready",
+                Status:  metav1.ConditionFalse,
+                Reason:  "SourceNotFound",
+                Message: fmt.Sprintf("Source ConfigMap %s/%s not found", replicator.Spec.SourceConfigMap.Namespace, replicator.Spec.SourceConfigMap.Name),
+            })
+            if err := r.Status().Update(ctx, replicator); err != nil {
+                log.Error(err, "unable to update status")
+            }
+            return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+        }
+        return ctrl.Result{}, err
+    }
+
+    replicatedTo := make([]platformv1alpha1.ReplicationStatus, 0, len(replicator.Spec.TargetNamespaces))
+    var failedNamespaces []string
+    for _, targetNS := range replicator.Spec.TargetNamespaces {
+        targetConfigMap := &corev1.ConfigMap{
+            ObjectMeta: metav1.ObjectMeta{
+                Name:      sourceConfigMap.Name,
+                Namespace: targetNS,
+            },
+        }
+
+        _, err := controllerutil.CreateOrUpdate(ctx, r.Client, targetConfigMap, func() error {
+            targetConfigMap.Data = sourceConfigMap.Data
+            targetConfigMap.BinaryData = sourceConfigMap.BinaryData
+            if targetConfigMap.Labels == nil {
+                targetConfigMap.Labels = make(map[string]string)
+            }
+            targetConfigMap.Labels["platform.example.com/replicated-from"] =
+                fmt.Sprintf("%s.%s", sourceConfigMap.Namespace, sourceConfigMap.Name)
+            return nil
+        })
+        if err != nil {
+            log.Error(err, "failed to replicate", "namespace", targetNS)
+            failedNamespaces = append(failedNamespaces, targetNS)
+            continue
+        }
+        replicatedTo = append(replicatedTo, platformv1alpha1.ReplicationStatus{
+            Namespace:    targetNS,
+            LastSyncTime: metav1.Now(),
+        })
+    }
+
+    // --- Pattern 3: Status Conditions ---
+    replicator.Status.ReplicatedTo = replicatedTo
+    if len(failedNamespaces) > 0 {
+        meta.SetStatusCondition(&replicator.Status.Conditions, metav1.Condition{
+            Type:    "Ready",
+            Status:  metav1.ConditionFalse,
+            Reason:  "PartialFailure",
+            Message: fmt.Sprintf("Failed to replicate to: %s", strings.Join(failedNamespaces, ", ")),
+        })
+    } else {
+        meta.SetStatusCondition(&replicator.Status.Conditions, metav1.Condition{
+            Type:    "Ready",
+            Status:  metav1.ConditionTrue,
+            Reason:  "ReplicationSucceeded",
+            Message: fmt.Sprintf("ConfigMap replicated to %d namespaces", len(replicatedTo)),
+        })
+    }
+    replicator.Status.ObservedGeneration = replicator.Generation
+
+    if err := r.Status().Update(ctx, replicator); err != nil {
+        return ctrl.Result{}, err
+    }
+
     return ctrl.Result{}, nil
 }
+
+func (r *ConfigMapReplicatorReconciler) deleteReplicatedConfigMaps(ctx context.Context, replicator *platformv1alpha1.ConfigMapReplicator) error {
+    for _, targetNS := range replicator.Spec.TargetNamespaces {
+        cm := &corev1.ConfigMap{}
+        err := r.Get(ctx, client.ObjectKey{
+            Name:      replicator.Spec.SourceConfigMap.Name,
+            Namespace: targetNS,
+        }, cm)
+        if apierrors.IsNotFound(err) {
+            continue
+        }
+        if err != nil {
+            return fmt.Errorf("get configmap %s/%s: %w", targetNS, replicator.Spec.SourceConfigMap.Name, err)
+        }
+        if err := r.Delete(ctx, cm); err != nil && !apierrors.IsNotFound(err) {
+            return fmt.Errorf("delete configmap %s/%s: %w", targetNS, replicator.Spec.SourceConfigMap.Name, err)
+        }
+    }
+    return nil
+}
+
+// SetupWithManager registers the controller with the manager.
+func (r *ConfigMapReplicatorReconciler) SetupWithManager(mgr ctrl.Manager) error {
+    return ctrl.NewControllerManagedBy(mgr).
+        For(&platformv1alpha1.ConfigMapReplicator{}).
+        Complete(r)
+}
 ```
 
-### Pattern 2: Idempotent Reconciliation
+## Part 3b: Create main.go
+
+Create the entrypoint in `main.go`:
 
 ```go
-// Get source ConfigMap
-sourceConfigMap := &corev1.ConfigMap{}
-err := r.Get(ctx, client.ObjectKey{
-    Name:      replicator.Spec.SourceConfigMap.Name,
-    Namespace: replicator.Spec.SourceConfigMap.Namespace,
-}, sourceConfigMap)
+package main
 
-// Replicate to each target namespace idempotently
-for _, targetNS := range replicator.Spec.TargetNamespaces {
-    targetConfigMap := &corev1.ConfigMap{
-        ObjectMeta: metav1.ObjectMeta{
-            Name:      sourceConfigMap.Name,
-            Namespace: targetNS,
-        },
+import (
+    "os"
+
+    "k8s.io/apimachinery/pkg/runtime"
+    utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+    clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+    ctrl "sigs.k8s.io/controller-runtime"
+    "sigs.k8s.io/controller-runtime/pkg/log/zap"
+
+    platformv1alpha1 "configmap-replicator/api/v1alpha1"
+    "configmap-replicator/controllers"
+)
+
+func main() {
+    scheme := runtime.NewScheme()
+    utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+    utilruntime.Must(platformv1alpha1.AddToScheme(scheme))
+
+    ctrl.SetLogger(zap.New())
+    log := ctrl.Log.WithName("setup")
+
+    mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+        Scheme: scheme,
+    })
+    if err != nil {
+        log.Error(err, "unable to create manager")
+        os.Exit(1)
     }
 
-    // CreateOrUpdate is idempotent - creates if missing, updates if exists
-    _, err := controllerutil.CreateOrUpdate(ctx, r.Client, targetConfigMap, func() error {
-        targetConfigMap.Data = sourceConfigMap.Data
-        targetConfigMap.BinaryData = sourceConfigMap.BinaryData
-        // Add labels to track replication source
-        if targetConfigMap.Labels == nil {
-            targetConfigMap.Labels = make(map[string]string)
-        }
-        targetConfigMap.Labels["platform.example.com/replicated-from"] =
-            fmt.Sprintf("%s/%s", sourceConfigMap.Namespace, sourceConfigMap.Name)
-        return nil
-    })
+    if err := (&controllers.ConfigMapReplicatorReconciler{
+        Client: mgr.GetClient(),
+        Scheme: mgr.GetScheme(),
+    }).SetupWithManager(mgr); err != nil {
+        log.Error(err, "unable to create controller")
+        os.Exit(1)
+    }
+
+    log.Info("Starting manager")
+    if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+        log.Error(err, "problem running manager")
+        os.Exit(1)
+    }
 }
 ```
 
-### Pattern 3: Status Conditions
+## Part 4: Generate CRD Manifest
 
-```go
-// Update status condition
-meta.SetStatusCondition(&replicator.Status.Conditions, metav1.Condition{
-    Type:    "Ready",
-    Status:  metav1.ConditionTrue,
-    Reason:  "ReplicationSucceeded",
-    Message: fmt.Sprintf("ConfigMap replicated to %d namespaces", len(replicator.Spec.TargetNamespaces)),
-})
-
-// Update observedGeneration
-replicator.Status.ObservedGeneration = replicator.Generation
-
-// Write status
-if err := r.Status().Update(ctx, replicator); err != nil {
-    return ctrl.Result{}, err
-}
-```
-
-See `controllers/configmapreplicator_controller.go` in this directory for the complete implementation.
-
-## Part 4: Generate Manifests
-
-If you're using kubebuilder markers (the `+kubebuilder:` comments), generate CRDs and RBAC:
+Use controller-gen to generate the CRD YAML from the kubebuilder markers in the types file:
 
 ```bash
 # Install controller-gen if not already installed
 go install sigs.k8s.io/controller-tools/cmd/controller-gen@latest
 
+# Generate DeepCopy methods (required for runtime.Object interface)
+controller-gen object paths=./api/...
+
 # Generate CRD YAML
 controller-gen crd paths=./api/... output:crd:artifacts:config=./config/crd
-
-# Generate RBAC YAML (based on markers in controller)
-controller-gen rbac:roleName=controller-role paths=./controllers/... output:rbac:artifacts:config=./config/rbac
 ```
-
-Alternatively, use the provided YAML files in this directory:
-- `config/crd/configmapreplicator-crd.yaml` - CRD definition
-- `config/rbac/role.yaml` - Required RBAC permissions
 
 ## Part 5: Run the Controller
 
 ### Step 1: Install CRD
 
 ```bash
-kubectl apply -f config/crd/configmapreplicator-crd.yaml
+kubectl apply -f config/crd/platform.example.com_configmapreplicators.yaml
 
 # Verify CRD is installed
 kubectl get crd configmapreplicators.platform.example.com
@@ -304,6 +464,9 @@ kubectl create configmap app-config \
 ### Step 4: Run Controller Locally
 
 ```bash
+# Resolve all transitive dependencies
+go mod tidy
+
 # Run controller (it will use your current kubeconfig)
 go run main.go
 ```
