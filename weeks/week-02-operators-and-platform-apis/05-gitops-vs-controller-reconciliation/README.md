@@ -53,7 +53,7 @@ This is where conflicts with GitOps arise.
 
 ### Server-Side Apply and Field Managers
 
-SSA (introduced in Kubernetes 1.18, stable in 1.22) solves the "who owns which field" problem. Every apply operation declares a field manager name. The API server tracks which manager last set each field in `metadata.managedFields`.
+SSA (alpha in Kubernetes 1.14, beta in 1.16, GA in 1.22) solves the "who owns which field" problem. Every apply operation declares a field manager name. The API server tracks which manager last set each field in `metadata.managedFields`.
 
 Example after SSA apply:
 

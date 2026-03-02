@@ -226,7 +226,7 @@ kubectl get pods -n istio-system -l app=istio-eastwestgateway -o name | \
 
 # Check connection overflow (circuit breaker trips)
 kubectl exec -n istio-system deploy/istio-eastwestgateway -- \
-  curl -s localhost:15000/stats | grep -E "overflow|cx_overflow"
+  curl -s localhost:15000/stats | grep -E "downstream_cx_overflow|upstream_cx_overflow|upstream_rq_pending_overflow"
 
 # Check EWG pod CPU and memory
 kubectl top pods -n istio-system -l app=istio-eastwestgateway

@@ -46,7 +46,7 @@ The certificate is loaded into Envoy's `DownstreamTlsContext` (for inbound conne
 4. A presents its X.509-SVID. B validates against `ROOTCA`.
 5. After the handshake, B's Envoy has the peer's SPIFFE URI available as the `source.principal` for AuthorizationPolicy evaluation. Envoy's `rbac` network filter or the `ext_authz` HTTP filter evaluates the policy.
 
-Istio rotates workload certificates automatically. The default `workloadCertTtl` is 24 hours; istiod pushes a new SDS response at approximately 12 hours (50% of TTL, controlled by `SecretRotationGracePeriodRatio` which defaults to 0.5). Envoy applies the new certificate without any connection disruption — existing TLS sessions continue using the old cert; new sessions use the new cert. The old cert remains in memory until its TTL expires. If SDS rotation fails (istiod unreachable), Envoy continues using the existing cert until its `notAfter` field is reached, at which point new TLS connections cannot be established.
+Istio rotates workload certificates automatically. The default `workloadCertTtl` is 24 hours; istiod pushes a new SDS response at exactly 50% of the certificate TTL (12 hours for the default 24h cert), controlled by `SecretRotationGracePeriodRatio` which defaults to 0.5. Envoy applies the new certificate without any connection disruption — existing TLS sessions continue using the old cert; new sessions use the new cert. The old cert remains in memory until its TTL expires. If SDS rotation fails (istiod unreachable), Envoy continues using the existing cert until its `notAfter` field is reached, at which point new TLS connections cannot be established.
 
 ### Principal Propagation Across Gateways
 

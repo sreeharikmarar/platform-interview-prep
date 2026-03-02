@@ -86,7 +86,7 @@ In this example, v1alpha1 had a single `host:port` pair. v1beta1 changed to a `l
 
 ### Conversion Strategies
 
-**None (default):** The API server changes only the `apiVersion` field and prunes unknown fields (depending on configuration). No field mapping or transformation occurs. This works when:
+**None (default):** The API server changes only the `apiVersion` field and validates against the target version's structural schema, rejecting unknown fields unless `x-kubernetes-preserve-unknown-fields` is set. No field mapping or transformation occurs. This works when:
 - All versions have identical schemas
 - Only the API version string differs between versions
 - You're okay with losing data in fields that don't exist in the target version

@@ -142,7 +142,7 @@ static_resources:
       # Interval at which hosts are analyzed for ejection eligibility.
       interval: 10s
       # Minimum time an ejected host stays out of rotation.
-      # Doubles on each successive ejection up to max_ejection_percent.
+      # Grows linearly on each successive ejection: base_ejection_time * ejection_count.
       base_ejection_time: 30s
       # Maximum percentage of hosts that can be ejected simultaneously.
       # Prevents outlier detection from removing all hosts during a correlated failure.
