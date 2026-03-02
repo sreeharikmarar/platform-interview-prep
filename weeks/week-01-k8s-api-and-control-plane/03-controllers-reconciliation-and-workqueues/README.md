@@ -56,7 +56,11 @@ The reconcile function must be idempotent and side-effect-free in terms of Kuber
 
 3. **Worker Loop**: Controller starts N worker goroutines (typically 1-5). Each runs:
    ```go
-   for queue.Get() {
+   for {
+       item, shutdown := queue.Get()
+       if shutdown {
+           return
+       }
        key := item.(string)
        err := reconcile(key)
        if err != nil {

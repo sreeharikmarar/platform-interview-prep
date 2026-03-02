@@ -17,7 +17,7 @@ By completing this lab, you will:
 
 ## Prerequisites
 
-- Go 1.21+ installed
+- Go 1.22+ installed
 - kind or other Kubernetes cluster (1.25+)
 - kubectl installed and configured
 - kubebuilder installed (optional, but helpful)

@@ -33,7 +33,7 @@ Understanding the decoupling between scheduler and controllers is critical. The 
 
 ### Scheduling Cycle
 
-1. **Pod Watch**: Scheduler's Informer watches for pods with `.spec.nodeName == ""` and `.status.phase == "Pending"`.
+1. **Pod Watch**: Scheduler's Informer watches for pods with `.spec.nodeName == ""` (unscheduled pods). The Pending phase is a consequence of having no node assigned, not a filter criterion.
 
 2. **Enqueue**: Unscheduled pods are added to the scheduling queue. The queue is a priority queue - pods with higher `.spec.priority` (from PriorityClass) are dequeued first.
 

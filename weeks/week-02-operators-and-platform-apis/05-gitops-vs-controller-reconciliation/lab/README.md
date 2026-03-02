@@ -101,7 +101,7 @@ Check managedFields:
 kubectl get deployment drift-demo -o jsonpath='{.metadata.managedFields}' | jq '.[] | select(.manager == "gitops-manager")'
 ```
 
-You should see `gitops-manager` owns most fields. The `last-applied-configuration` annotation is gone (SSA doesn't use it).
+You should see `gitops-manager` owns most fields. SSA relies on `managedFields` instead of the `last-applied-configuration` annotation. However, kubectl may still maintain the annotation for backward compatibility when using the default field manager.
 
 ## Step 5: Simulate Controller Update with SSA Conflict
 

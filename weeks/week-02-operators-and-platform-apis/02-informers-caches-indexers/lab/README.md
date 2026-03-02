@@ -355,7 +355,7 @@ func main() {
     }
     duration := time.Since(start)
 
-    allPods, _ := podInformer.Lister().List(metav1.LabelSelector{}.AsSelector())
+    allPods, _ := podInformer.Lister().List(labels.Everything())
     fmt.Printf("\nCache sync completed in %v\n", duration)
     fmt.Printf("Total pods cached: %d\n", len(allPods))
     fmt.Printf("ADD events triggered: %d\n", addCount)

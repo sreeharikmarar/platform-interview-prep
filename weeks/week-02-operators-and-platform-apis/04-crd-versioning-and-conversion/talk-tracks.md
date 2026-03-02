@@ -28,15 +28,15 @@ There's a subtle ordering requirement when changing storage versions. You can't 
 
 **Answer:**
 
-Automatic conversion works for simple schema changes where fields are added, removed, or renamed, but the overall structure stays the same. For example, if v1alpha1 has field foo and v1beta1 renames it to bar, but both are still strings, the API server can convert automatically by mapping field names. If you add a field with a default value, or remove a field (dropping data is okay for deprecated fields), that's also automatic.
+Kubernetes CRDs have only two conversion strategies: `None` and `Webhook`. The `None` strategy changes only the `apiVersion` field and prunes unknown fields — it does NOT perform automatic field mapping or renaming. If v1alpha1 has field `foo` and v1beta1 renames it to `bar`, the `None` strategy will drop `foo` when converting to v1beta1, resulting in data loss. Even simple field renaming requires a webhook.
 
-You need a conversion webhook for structural changes that can't be expressed as simple field mappings. Examples: converting a single-value field to an array (host → listeners[]), splitting one field into multiple (address → hostname + port), or any semantic transformation. If v1alpha1 stores a duration as a string "5m" and v1beta1 stores it as an integer 300, the webhook must parse and convert.
+You need a conversion webhook for any schema change beyond identical schemas with different version strings. Examples: field renaming (foo → bar), restructuring (single field → array), semantic transformation (string "5m" → integer 300), or any case where fields differ between versions. In practice, if your versions have any schema differences, you need a webhook.
 
-The key question is: can you write a simple lossless mapping between schemas? If yes, automatic conversion might work. If no, you need a webhook. In practice, anything non-trivial requires a webhook because automatic conversion is limited to structural patterns the API server can infer.
+The key question is: are the schemas identical across versions? If yes, `None` works. If no — even for simple field renames — you need a webhook.
 
 **If they push deeper:**
 
-Automatic conversion uses the x-kubernetes-preserve-unknown-fields OpenAPI annotation to handle unknown fields. If a client sends a field that doesn't exist in the schema, it's preserved if this annotation is set. This allows additive schema changes without a webhook. But it's dangerous—you lose validation on those fields, and they're stored as raw JSON. For production CRDs, prefer explicit schemas and webhooks over preserve-unknown-fields. Also, note that automatic conversion only works if all versions use OpenAPIv3 schemas. If you're migrating from older CRDs that used validation: instead of openAPIV3Schema:, you must add schemas before attempting automatic conversion.
+The `x-kubernetes-preserve-unknown-fields` OpenAPI annotation is a schema validation feature, not a conversion feature. Setting it to `true` prevents the API server from pruning unknown fields during validation, which can help with additive schema changes (adding optional fields) when using `conversion.strategy: None`. However, it does NOT enable automatic field mapping or renaming between versions. Note that if `spec.preserveUnknownFields` is `true` at the CRD level, `conversion.strategy` MUST be `None` — you cannot use webhook conversion. For production CRDs, prefer explicit schemas and webhooks over preserve-unknown-fields, as you lose validation on unrecognized fields.
 
 ## Q: What is round-trip fidelity and why does it matter?
 

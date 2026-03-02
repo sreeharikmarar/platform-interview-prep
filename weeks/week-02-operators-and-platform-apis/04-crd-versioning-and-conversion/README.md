@@ -86,19 +86,19 @@ In this example, v1alpha1 had a single `host:port` pair. v1beta1 changed to a `l
 
 ### Conversion Strategies
 
-**None (default):** Only one version exists. No conversion needed.
+**None (default):** The API server changes only the `apiVersion` field and prunes unknown fields (depending on configuration). No field mapping or transformation occurs. This works when:
+- All versions have identical schemas
+- Only the API version string differs between versions
+- You're okay with losing data in fields that don't exist in the target version
 
-**Automatic structural conversion:** For compatible changes where fields are added/removed but the structure is similar, the API server can convert automatically. This works when:
-- Fields are added with defaults
-- Fields are removed (data is dropped)
-- Field names change but types are identical
+With `None` strategy, data in fields available in the old version but not in the new version will be lost. Fields with the same name but mismatched structures will cause errors. There is no automatic field renaming or mapping — even simple renames require a webhook.
 
-Automatic conversion is limited. It doesn't handle:
+**Webhook conversion:** For any schema differences between versions, you must use a conversion webhook. The API server calls your webhook with a ConversionReview request containing the object in one version and returns it in another. This is required when:
 - Restructuring (single field → array, or vice versa)
-- Renaming with transformation (host → listeners[0].hostname)
+- Renaming fields (host → listeners[0].hostname)
 - Semantic changes (splitting one field into two)
-
-**Webhook conversion:** For complex changes, you deploy a webhook that receives a ConversionReview request containing the object in one version and returns it in another version.
+- Adding required fields that didn't exist in earlier versions
+- Any transformation beyond changing the `apiVersion` string
 
 ### Conversion Webhook Protocol
 
