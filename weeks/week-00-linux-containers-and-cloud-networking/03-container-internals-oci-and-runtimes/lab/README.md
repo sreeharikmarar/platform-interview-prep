@@ -104,9 +104,7 @@ ctr -n k8s.io content ls | sort -k2 -h -r | head -10
 
 # Check if the alpine layer blob is referenced by both images
 # Find layer digests from each image's manifest
-LAYER_DIGEST_319=$(ctr -n k8s.io images ls | grep "alpine:3.19" | awk '{print $2}' | \
-  xargs -I{} bash -c "cat ${BLOB_DIR}/{#sha256:} | jq -r '.layers[0].digest'" 2>/dev/null || \
-  cat "${BLOB_DIR}/${DIGEST_HEX}" | jq -r '.layers[0].digest')
+LAYER_DIGEST_319=$(cat "${BLOB_DIR}/${DIGEST_HEX}" | jq -r '.layers[0].digest')
 echo "Alpine 3.19 layer 0: $LAYER_DIGEST_319"
 
 # Verify the blob file exists for this digest
@@ -299,6 +297,8 @@ echo "Layer digest: $LAYER_DIGEST"
 
 # Extract the compressed tar layer into rootfs/
 # The blob is a gzip-compressed tar
+# Note: Alpine 3.19 has a single layer, so extracting layers[0] is sufficient.
+# Multi-layer images would need to extract all layers in order (base first, then each upper layer).
 zcat "${BLOB_DIR}/${LAYER_DIGEST}" | tar -xf - -C /tmp/runc-demo/rootfs/
 
 # Verify the rootfs has a real Linux filesystem layout

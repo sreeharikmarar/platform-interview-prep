@@ -33,7 +33,6 @@ CONTAINER_NAME="scratch-demo-$$"  # unique name using current PID
 # the rootfs does not need /lib/libc.so or any other library.
 # This is the minimal viable rootfs: a single directory containing one binary.
 BUSYBOX_URL="https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox"
-BUSYBOX_SHA256="6e123e7f3202a8c4e27dc8d4c878f53a"  # partial check; full check below
 
 # --- Functions ---------------------------------------------------------------
 
@@ -270,7 +269,7 @@ runc create --bundle "$BUNDLE_DIR" "$CONTAINER_NAME2"
 
 # At this point the container exists in a "created" state.
 # runc spawned an init process inside the namespaces, but the init is blocked
-# waiting for the 'start' signal over an internal unix socket.
+# waiting for the 'start' signal via the exec.fifo FIFO.
 log "  Container state after create:"
 runc state "$CONTAINER_NAME2" | python3 -c "
 import json, sys

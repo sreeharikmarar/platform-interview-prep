@@ -162,9 +162,10 @@ ls /proc/
 ```bash
 # In a second terminal on the host:
 cat /proc/mounts | grep myrootfs
-# Should show the bind mount of proc inside /tmp/myrootfs/proc
-# This is visible on the host because it happens before the namespace is fully isolated
-# In a real container runtime, the mount happens AFTER CLONE_NEWNS, making it invisible
+# May show the proc mount inside /tmp/myrootfs/proc depending on mount propagation.
+# In this demo, mount propagation may be set to 'shared' by default, making it visible.
+# In production container runtimes, the new mount namespace immediately calls
+# mount(MS_PRIVATE | MS_REC) on the root to prevent any propagation to the host.
 
 mount | grep myrootfs
 ```
@@ -226,7 +227,8 @@ cat /sys/fs/cgroup/lab-demo/cpu.max
 ```bash
 # Start a bash shell and add it to the cgroup
 # cgexec (from cgroup-tools) is the clean way, or write the PID directly
-sudo cgexec -g memory:lab-demo bash &
+# cgroupsv2 syntax: -g :<path> (no controller prefix; v1 used -g controller:path)
+sudo cgexec -g :lab-demo bash &
 CGROUP_BASH_PID=$!
 echo "Launched bash PID: $CGROUP_BASH_PID"
 
@@ -290,7 +292,7 @@ echo "31457280" | sudo tee /sys/fs/cgroup/lab-demo/memory.max
 
 # Run the memory-eating script inside the cgroup
 # cgexec adds the process to the cgroup before exec
-sudo cgexec -g memory:lab-demo /tmp/eat-memory.sh
+sudo cgexec -g :lab-demo /tmp/eat-memory.sh
 ```
 
 **What's happening**: The script continuously allocates memory. When it tries to allocate beyond 30MB, the kernel first attempts to reclaim page cache. Since there is nothing to reclaim (the allocations are anonymous memory from `base64`), the kernel invokes the OOM killer within the `lab-demo` cgroup scope. The script's process receives SIGKILL (signal 9) and exits.

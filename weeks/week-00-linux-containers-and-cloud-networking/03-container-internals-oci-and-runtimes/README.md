@@ -41,7 +41,7 @@ The pod sandbox model adds one more layer on top of this stack that is specific 
 
 - **gVisor (runsc)**: A container runtime from Google that interposes a user-space kernel (the Sentry) between the application and the host kernel. The Sentry intercepts all system calls from the application and handles them within user space, only calling a limited set of host kernel syscalls for I/O (mediated through the Gofer process, which handles filesystem operations). This creates a strong isolation boundary — even a kernel exploit inside the container cannot escape through the Sentry because the Sentry is user space, not kernel space. Overhead is approximately 10-15% for CPU-bound workloads and higher for syscall-heavy or I/O-heavy workloads. Used via RuntimeClass `runsc`.
 
-- **Kata Containers**: A container runtime that runs each container (or pod) inside a lightweight virtual machine using QEMU or Firecracker as the hypervisor. The VM has its own Linux kernel, providing hardware-enforced isolation. The container's rootfs is mounted into the VM, and the container process runs inside the VM kernel's PID namespace. The overhead is primarily VM startup latency (50-500ms, lower with Firecracker) and memory overhead per VM (the VM kernel itself consumes ~128MB+). Kata containers look like standard OCI containers to containerd but are identified by the `io.containerd.kata.v2` shim. Used via RuntimeClass `kata-fc` (Firecracker) or `kata-qemu`.
+- **Kata Containers**: A container runtime that runs each container (or pod) inside a lightweight virtual machine using QEMU or Firecracker as the hypervisor. The VM has its own Linux kernel, providing hardware-enforced isolation. The container's rootfs is mounted into the VM, and the container process runs inside the VM kernel's PID namespace. The overhead is primarily VM startup latency (50-500ms, lower with Firecracker) and memory overhead per VM (the VM kernel itself consumes ~128MB+). Kata containers look like standard OCI containers to containerd but use a dedicated shim binary (`containerd-shim-kata-v2`, identified by the runtime type `io.containerd.kata.v2`). Used via RuntimeClass `kata-fc` (Firecracker) or `kata-qemu`.
 
 - **OCI Distribution Spec**: The API that container registries implement for push and pull operations. Pull is a sequence of HTTP calls: `GET /v2/<name>/manifests/<tag>` to retrieve the manifest (by tag or digest), then `GET /v2/<name>/blobs/<digest>` for each blob (layers, config). Layers are served as gzip-compressed tar streams. Promotion of an image across registry repositories is done by copying manifests and blobs by digest — no re-compression needed because the digest remains the same.
 
@@ -70,7 +70,7 @@ If containerd crashes and restarts, it reads all shim socket paths from the stat
 
 ### runc Execution Path — clone, Namespace Bootstrap, and exec
 
-runc's execution is split into two phases separated by a unix socket synchronization to allow the parent (the shim) to set up cgroup membership before the user process starts.
+runc's execution is split into two phases separated by a FIFO (`exec.fifo` in the container state directory) to allow the parent (the shim) to set up cgroup membership before the user process starts.
 
 `runc create` performs these steps:
 
@@ -79,9 +79,9 @@ runc's execution is split into two phases separated by a unix socket synchroniza
 3. Inside the new mount namespace, the child pivots the root to the bundle's `rootfs/` directory using `pivot_root()` (preferred over `chroot` because it changes the mount namespace root cleanly without leaving the old root accessible). It then bind-mounts `/proc`, `/sys`, `/dev`, and any additional mounts from config.json.
 4. The child sets cgroup membership by writing its PID to the cgroup path specified in config.json (or via cgroupv2 `cgroup.procs`). The shim's parent process handles cgroup creation if needed.
 5. The child drops capabilities to the set specified in `process.capabilities.bounding` and `process.capabilities.effective`. It applies seccomp filters via `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ...)`. It sets the uid/gid from `process.user`.
-6. The child then blocks on the unix synchronization socket waiting for `runc start`.
+6. The child then blocks on opening the `exec.fifo` FIFO for writing, waiting for `runc start`.
 
-`runc start` sends the start signal over the unix socket. The runc init process calls `exec()` to replace itself with the user's process binary (the `args[0]` from config.json). This exec is the moment PID 1 inside the container's PID namespace becomes the user process. runc itself exits after sending the start signal.
+`runc start` opens the `exec.fifo` for reading, which unblocks the init process. The runc init process calls `exec()` to replace itself with the user's process binary (the `args[0]` from config.json). This exec is the moment PID 1 inside the container's PID namespace becomes the user process. runc itself exits after sending the start signal.
 
 The runc init process and the eventual exec'd process share the same PID — because exec replaces the process image in-place. The container's PID 1 in the host PID namespace is the shim's child process (the one that called `clone()`). This is the host-visible PID that systemd or cgroup v2 controllers manage.
 
@@ -95,7 +95,7 @@ When containerd pulls an image (either via a `ctr images pull` command or becaus
 
 3. **Layer fetch and store**: For each layer descriptor in the manifest, containerd checks the content store for a blob at that digest. If absent, it fetches the compressed tar from the registry (`GET /v2/<repo>/blobs/<digest>`) and streams it to the content store, verifying the compressed digest as bytes arrive. The layer is stored as a compressed blob in the CAS directory. containerd does not decompress at this stage.
 
-4. **Snapshot preparation (extraction)**: After all blobs are present in the content store, containerd calls the snapshotter's `Prepare` method for each layer in order. The snapshotter decompresses the tar and applies it as a new snapshot layer, building up the overlay stack. The decompressed content is placed in the snapshotter's working directory (e.g., `/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/<id>/fs/`). The uncompressed layer digest is verified against `rootfs.diff_ids` from the config. Each snapshot is a read-only layer referenced by its parent, forming a chain from the base layer to the top layer.
+4. **Snapshot preparation (extraction)**: After all blobs are present in the content store, containerd calls the snapshotter's `Prepare` method for each layer in order. The snapshotter decompresses the tar and applies it as a new snapshot layer, building up the overlay stack. The decompressed content is placed in the snapshotter's working directory (e.g., `/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/<id>/fs/`). As the tar is decompressed, the snapshotter computes the SHA-256 hash of the uncompressed content on the fly and verifies it against the corresponding entry in `rootfs.diff_ids` from the config. Each snapshot is a read-only layer referenced by its parent, forming a chain from the base layer to the top layer.
 
 5. **Container rootfs assembly**: When a container is started, the snapshotter's `Prepare` method is called one more time to create a new *writable* snapshot on top of the image's top read-only layer. For overlayfs, this writable snapshot is the overlay's upperdir. The overlay mount uses all read-only snapshot dirs as lowerdir in order. The result is a merged directory tree presented to runc as the bundle's rootfs.
 

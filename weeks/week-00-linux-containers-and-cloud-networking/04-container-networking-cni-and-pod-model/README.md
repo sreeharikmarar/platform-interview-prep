@@ -21,7 +21,7 @@ eBPF is fundamentally changing where this logic runs. Traditional CNI implementa
 
 - **Linux network namespace**: A full isolated copy of the kernel's network stack. Has its own loopback (`lo`), Ethernet interfaces, routing table, ARP table, conntrack table, and iptables rules. Created via `clone(CLONE_NEWNET)` or `unshare -n`. New namespaces start with only `lo`; all other interfaces must be explicitly added.
 
-- **veth pair**: Two virtual Ethernet interfaces linked at the kernel level. A packet injected into one end (`vethXXX` in root ns) immediately emerges from the other end (`eth0` in pod ns), and vice versa. They are created together with `ip link add veth0 type veth peer name veth1`. Moving one end to a different namespace with `ip link set veth1 netns <pid>` creates the bridge from root ns to pod ns.
+- **veth pair**: Two virtual Ethernet interfaces linked at the kernel level. A packet injected into one end (`vethXXX` in root ns) immediately emerges from the other end (`eth0` in pod ns), and vice versa. They are created together with `ip link add veth0 type veth peer name veth1`. Moving one end to a different namespace with `ip link set veth1 netns <pid>` establishes the link between the root ns and the pod ns.
 
 - **Linux bridge**: A software Layer 2 switch (virtual switch) in the kernel. Learns MAC addresses from traffic, forwards frames to the correct port, handles ARP proxy, and can broadcast to all ports for unknown destinations. Kubernetes CNI plugins typically name the bridge `cni0` (Flannel) or `cbr0` (kubenet). The bridge IP (e.g., `10.244.0.1/24`) is the default gateway for all pods on the node and is the interface the host uses to reach pods.
 
